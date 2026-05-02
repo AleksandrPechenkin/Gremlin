@@ -23,14 +23,10 @@
 (иконка OneDrive в трее — без «в ожидании»).
 
 2) Git + GitHub (рекомендуется для истории версий и копии вне OneDrive)
-На этом ПК Git не обнаружен. Установите «Git for Windows» с git-scm.com,
-перезапустите Cursor, затем в папке проекта в PowerShell:
+Git установлен, в папке проекта уже выполнены: git init и первый коммит (ветка master).
+Локальная история версий доступна командой: git log --oneline
 
-  git init
-  git add .
-  git commit -m "Первый коммит: проект Gremlin"
-
-На github.com создайте пустой репозиторий (без README), затем:
+На github.com создайте пустой репозиторий (без README), в папке проекта в PowerShell:
 
   git remote add origin https://github.com/ВАШ_ЛОГИН/ИМЯ_РЕПО.git
   git branch -M main
