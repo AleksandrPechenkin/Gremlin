@@ -1,0 +1,14 @@
+# Локальные / временные
+Thumbs.db
+Desktop.ini
+*.log
+.DS_Store
+
+# Если позже появится clasp (не коммитить секреты в публичный репозиторий)
+.clasp.json
+.clasprc.json
+
+# Редакторы
+.idea/
+.vscode/
+*.swp

@@ -1,0 +1,523 @@
+// ============================================
+// ПОЛНЫЙ СКРИПТ ДЛЯ РЕЕСТРА ПЛАТЕЖЕЙ
+// С ИСПРАВЛЕННОЙ АВТОРИЗАЦИЕЙ
+// ============================================
+
+// === НАСТРОЙКИ ===
+var НАСТРОЙКИ = {
+  руководители: [
+    "vovaeroklinzev@gmail.com",
+    "eroklintsev91@gmail.com",
+    "m.kostenko0209@gmail.com"
+  ],
+  
+  бухгалтеры: [
+    "eroklintsev91@gmail.com",
+    "m.kostenko0209@gmail.com"
+  ],
+  
+  корневаяПапка: "1wMYUKNsNixmNcI1HdsmScn4V-G5Vy6wL",
+  листРеестр: "Реестр",
+  
+  колонки: {
+    датаЗаявки: 1, оплатитьДо: 2, инициатор: 3, подразделение: 4,
+    контрагент: 5, назначение: 6, сумма: 7, валюта: 8,
+    документ: 9, статусСогласования: 10, ктоСогласовал: 11,
+    датаСогласования: 12, комментарий: 13, статусОплаты: 14,
+    датаОплаты: 15, суммаРуб: 16, автор: 17, номерЗаявки: 18, ссылкаНаПапку: 19
+  }
+};
+
+// === ПОЛЬЗОВАТЕЛЬСКОЕ МЕНЮ ===
+function onOpen() {
+  var ui = SpreadsheetApp.getUi();
+  ui.createMenu('📋 РЕЕСТР ПЛАТЕЖЕЙ')
+    .addItem('➕ Новая заявка (с документами)', 'showRequestDialog')
+    .addSeparator()
+    .addItem('👑 СОГЛАСОВАТЬ ЗАЯВКИ (для руководителя)', 'showApprovalDialog')
+    .addSeparator()
+    .addItem('🔐 АВТОРИЗАЦИЯ (ОБЯЗАТЕЛЬНО!)', 'forceAuthorization')
+    .addItem('✅ Проверить авторизацию', 'checkAuthorization')
+    .addItem('📁 Проверить доступ к папке', 'checkFolderAccess')
+    .addItem('🔄 Обновить курсы валют', 'refreshCurrencyRates')
+    .addItem('🎨 Обновить цвета', 'refreshColors')
+    .addSeparator()
+    .addItem('🔓 СНЯТЬ ВСЕ ЗАЩИТЫ', 'removeAllProtectionsCompletely')
+    .addItem('🔍 Проверить мои права', 'checkUserPermissionsDetailed')
+    .addItem('📋 Обновить выпадающие списки', 'forceUpdateDropdowns')
+    .addSeparator()
+    .addItem('📊 Создать/обновить дашборд', 'createOrUpdateDashboard')
+    .addItem('🔧 Тест доступа к Drive', 'testDriveAccess')
+    .addSeparator()
+    .addItem('⚙️ Инициализировать систему', 'initializeSystem')
+    .addItem('📁 Открыть папку с файлами', 'openDriveFolder')
+    .addItem('❓ Помощь', 'showHelp')
+    .addToUi();
+}
+
+// === ФУНКЦИЯ ДЛЯ ПРИНУДИТЕЛЬНОЙ АВТОРИЗАЦИИ ===
+function forceAuthorization() {
+  try {
+    var userEmail = Session.getActiveUser().getEmail();
+    var ss = SpreadsheetApp.getActiveSpreadsheet();
+    var sheet = ss.getActiveSheet();
+    var cell = sheet.getRange(1, 1);
+    var value = cell.getValue();
+    var testFolder = DriveApp.getRootFolder();
+    var ui = SpreadsheetApp.getUi();
+    ui.alert('✅ АВТОРИЗАЦИЯ УСПЕШНА!', 
+             'Пользователь: ' + userEmail + '\n\nВсе разрешения получены. Теперь вы можете:\n• Создавать заявки\n• Загружать файлы\n• Согласовывать заявки',
+             ui.ButtonSet.OK);
+  } catch (error) {
+    var ui = SpreadsheetApp.getUi();
+    ui.alert('⚠️ ТРЕБУЕТСЯ АВТОРИЗАЦИЯ', 
+             'Для работы скрипта необходимо разрешить доступ.\n\nИНСТРУКЦИЯ:\n1. Нажмите "Расширения" → "Apps Script"\n2. В редакторе выберите функцию "forceAuthorization"\n3. Нажмите кнопку "Запустить" (▶)\n4. Нажмите "Review Permissions"\n5. Выберите свой аккаунт\n6. Нажмите "Allow" (Разрешить)\n7. Закройте редактор и обновите страницу',
+             ui.ButtonSet.OK);
+  }
+}
+
+// === ПРОВЕРКА АВТОРИЗАЦИИ ===
+function checkAuthorization() {
+  try {
+    var userEmail = Session.getActiveUser().getEmail();
+    var ss = SpreadsheetApp.getActiveSpreadsheet();
+    var ui = SpreadsheetApp.getUi();
+    ui.alert('✅ АВТОРИЗАЦИЯ УСПЕШНА!', 
+             'Пользователь: ' + userEmail + '\n\nТеперь вы можете создавать заявки.',
+             ui.ButtonSet.OK);
+    return true;
+  } catch (error) {
+    SpreadsheetApp.getUi().alert('❌ АВТОРИЗАЦИЯ НЕ ВЫПОЛНЕНА', 
+                                  'Нажмите "🔐 АВТОРИЗАЦИЯ (ОБЯЗАТЕЛЬНО!)" в меню.',
+                                  SpreadsheetApp.getUi().ButtonSet.OK);
+    return false;
+  }
+}
+
+// === ПОКАЗ ДИАЛОГОВОГО ОКНА НОВОЙ ЗАЯВКИ ===
+function showRequestDialog() {
+  try {
+    var userEmail = Session.getActiveUser().getEmail();
+    var ss = SpreadsheetApp.getActiveSpreadsheet();
+    var html = HtmlService.createHtmlOutputFromFile('RequestForm')
+        .setWidth(650)
+        .setHeight(750)
+        .setSandboxMode(HtmlService.SandboxMode.IFRAME);
+    SpreadsheetApp.getUi().showModalDialog(html, '📝 Новая заявка');
+  } catch (error) {
+    SpreadsheetApp.getUi().alert('⚠️ ОШИБКА АВТОРИЗАЦИИ', 
+                                  'Сначала выполните:\n\n📋 РЕЕСТР ПЛАТЕЖЕЙ → 🔐 АВТОРИЗАЦИЯ (ОБЯЗАТЕЛЬНО!)',
+                                  SpreadsheetApp.getUi().ButtonSet.OK);
+  }
+}
+
+// === ПОКАЗ ДИАЛОГОВОГО ОКНА ДЛЯ СОГЛАСОВАНИЯ ===
+function showApprovalDialog() {
+  try {
+    var userEmail = Session.getActiveUser().getEmail();
+    var ss = SpreadsheetApp.getActiveSpreadsheet();
+    var isBoss = false;
+    for (var i = 0; i < НАСТРОЙКИ.руководители.length; i++) {
+      if (НАСТРОЙКИ.руководители[i].toLowerCase() === userEmail.toLowerCase()) {
+        isBoss = true;
+        break;
+      }
+    }
+    if (!isBoss) {
+      SpreadsheetApp.getUi().alert('❌ Доступ запрещен', 
+                                    'Этот раздел только для руководителей.',
+                                    SpreadsheetApp.getUi().ButtonSet.OK);
+      return;
+    }
+    var html = HtmlService.createHtmlOutputFromFile('ApprovalDialog')
+        .setWidth(450)
+        .setHeight(700)
+        .setSandboxMode(HtmlService.SandboxMode.IFRAME);
+    SpreadsheetApp.getUi().showModalDialog(html, '👑 Согласование заявок');
+  } catch (error) {
+    SpreadsheetApp.getUi().alert('⚠️ ОШИБКА АВТОРИЗАЦИИ', 
+                                  'Сначала выполните:\n\n📋 РЕЕСТР ПЛАТЕЖЕЙ → 🔐 АВТОРИЗАЦИЯ (ОБЯЗАТЕЛЬНО!)',
+                                  SpreadsheetApp.getUi().ButtonSet.OK);
+  }
+}
+
+// === СОЗДАНИЕ ЗАЯВКИ ===
+function createRequest(formData, files) {
+  try {
+    Logger.log('=== НАЧАЛО СОЗДАНИЯ ЗАЯВКИ ===');
+    var userEmail = Session.getActiveUser().getEmail();
+    if (!userEmail) {
+      throw new Error('Пользователь не определен. Выполните авторизацию.');
+    }
+    var ss = SpreadsheetApp.getActiveSpreadsheet();
+    var sheet = ss.getSheetByName(НАСТРОЙКИ.листРеестр);
+    if (!sheet) {
+      sheet = ss.insertSheet(НАСТРОЙКИ.листРеестр);
+      initializeNewSheet(sheet);
+    }
+    var lastRow = sheet.getLastRow();
+    var requestNumber = 'ЗАЯВКА-' + new Date().getFullYear() + '-' + 
+                        String(lastRow).padStart(4, '0');
+    var folder = null;
+    var folderLink = '';
+    var fileLinks = [];
+    try {
+      folder = createRequestFolder(requestNumber, formData, userEmail);
+      if (folder) {
+        folderLink = folder.getUrl();
+        if (files && files.length > 0) {
+          fileLinks = uploadFilesToFolder(folder, files);
+        }
+      }
+    } catch (folderError) {
+      Logger.log('Ошибка папки: ' + folderError);
+    }
+    var newRow = lastRow + 1;
+    sheet.insertRowAfter(lastRow);
+    sheet.getRange(newRow, 1).setValue(new Date(formData.dateRequest));
+    sheet.getRange(newRow, 2).setValue(new Date(formData.datePayment));
+    sheet.getRange(newRow, 3).setValue(formData.initiator || '');
+    sheet.getRange(newRow, 4).setValue(formData.department || '');
+    sheet.getRange(newRow, 5).setValue(formData.counterparty || '');
+    sheet.getRange(newRow, 6).setValue(formData.purpose || '');
+    sheet.getRange(newRow, 7).setValue(parseFloat(formData.amount) || 0);
+    sheet.getRange(newRow, 8).setValue(formData.currency || 'RUB');
+    if (fileLinks.length > 0) {
+      sheet.getRange(newRow, 9).setValue(fileLinks.join('\n'));
+    }
+    sheet.getRange(newRow, 10).setValue("На согласовании");
+    sheet.getRange(newRow, 14).setValue("Не оплачено");
+    sheet.getRange(newRow, 17).setValue(userEmail);
+    sheet.getRange(newRow, 18).setValue(requestNumber);
+    if (folderLink) {
+      sheet.getRange(newRow, 19).setValue(folderLink);
+    }
+    addRubFormula(newRow);
+    Logger.log('=== ЗАЯВКА СОЗДАНА: ' + requestNumber + ' ===');
+    return requestNumber;
+  } catch (error) {
+    Logger.log('ОШИБКА: ' + error.toString());
+    throw new Error('Ошибка: ' + error.toString());
+  }
+}
+
+// === ПЕРЕСЧЕТ В РУБЛИ ===
+function addRubFormula(row) {
+  var sheet = SpreadsheetApp.getActive().getSheetByName(НАСТРОЙКИ.листРеестр);
+  var валюта = sheet.getRange(row, НАСТРОЙКИ.колонки.валюта).getValue();
+  var формула = '=G' + row;
+  if (валюта == "USD" || валюта == "EUR" || валюта == "CNY") {
+    формула = '=G' + row + '*GOOGLEFINANCE("CURRENCY:' + валюта + 'RUB")';
+  }
+  sheet.getRange(row, НАСТРОЙКИ.колонки.суммаРуб).setFormula(формула);
+}
+
+// === ОБНОВЛЕНИЕ КУРСОВ ===
+function refreshCurrencyRates() {
+  var sheet = SpreadsheetApp.getActive().getSheetByName(НАСТРОЙКИ.листРеестр);
+  var lastRow = sheet.getLastRow();
+  for (var row = 2; row <= lastRow; row++) {
+    try { addRubFormula(row); } catch(e) {}
+  }
+  showAlert('✅ Курсы обновлены');
+}
+
+// === СОЗДАНИЕ ПАПКИ ===
+function createRequestFolder(requestNumber, formData, userEmail) {
+  try {
+    var rootFolder;
+    if (НАСТРОЙКИ.корневаяПапка && НАСТРОЙКИ.корневаяПапка.trim() !== '') {
+      try {
+        rootFolder = DriveApp.getFolderById(НАСТРОЙКИ.корневаяПапка.trim());
+      } catch (e) {
+        rootFolder = DriveApp.getRootFolder();
+      }
+    } else {
+      rootFolder = DriveApp.getRootFolder();
+    }
+    var safeCounterparty = (formData.counterparty || 'Контрагент').replace(/[^\w\sа-яА-ЯёЁ]/gi, '');
+    var folder = rootFolder.createFolder(requestNumber + ' - ' + safeCounterparty);
+    folder.createFile('описание.txt', 'Заявка: ' + requestNumber + '\nСумма: ' + formData.amount + ' ' + formData.currency);
+    return folder;
+  } catch (error) {
+    return null;
+  }
+}
+
+// === ЗАГРУЗКА ФАЙЛОВ ===
+function uploadFilesToFolder(folder, files) {
+  var fileLinks = [];
+  if (!folder) return fileLinks;
+  for (var i = 0; i < files.length; i++) {
+    try {
+      var blob = Utilities.newBlob(Utilities.base64Decode(files[i].data), files[i].type, files[i].name);
+      fileLinks.push(folder.createFile(blob).getUrl());
+    } catch (error) {}
+  }
+  return fileLinks;
+}
+
+// === ИНИЦИАЛИЗАЦИЯ НОВОГО ЛИСТА ===
+function initializeNewSheet(sheet) {
+  var headers = [
+    'Дата заявки', 'Оплатить до', 'Инициатор', 'Подразделение', 
+    'Контрагент', 'Назначение платежа', 'Сумма платежа', 'Валюта',
+    'Документы', 'Статус согласования', 'Кто согласовал',
+    'Дата согласования', 'Комментарий', 'Статус оплаты', 'Дата оплаты', 
+    'Сумма в рублях', 'Автор', 'Номер заявки', 'Ссылка на папку'
+  ];
+  sheet.getRange(1, 1, 1, 19).setValues([headers]);
+  sheet.getRange(1, 1, 1, 19).setFontWeight('bold');
+  sheet.setFrozenRows(1);
+}
+
+// === ПОЛУЧЕНИЕ СПИСКА ЗАЯВОК ДЛЯ СОГЛАСОВАНИЯ ===
+function getPendingRequests() {
+  try {
+    var sheet = SpreadsheetApp.getActive().getSheetByName(НАСТРОЙКИ.листРеестр);
+    if (!sheet) return [];
+    var data = sheet.getRange(2, 1, sheet.getLastRow() - 1, 19).getValues();
+    var pending = [];
+    for (var i = 0; i < data.length; i++) {
+      if (data[i][9] == "На согласовании") {
+        pending.push({
+          row: i + 2,
+          dateRequest: data[i][0] ? Utilities.formatDate(new Date(data[i][0]), Session.getScriptTimeZone(), 'dd.MM.yyyy') : '',
+          datePayment: data[i][1] ? Utilities.formatDate(new Date(data[i][1]), Session.getScriptTimeZone(), 'dd.MM.yyyy') : '',
+          initiator: data[i][2] || '',
+          department: data[i][3] || '',
+          counterparty: data[i][4] || '',
+          purpose: data[i][5] || '',
+          amount: data[i][6] || 0,
+          currency: data[i][7] || '',
+          requestNumber: data[i][17] || '',
+          folderLink: data[i][18] || ''
+        });
+      }
+    }
+    return pending;
+  } catch (error) {
+    return [];
+  }
+}
+
+// === СОГЛАСОВАНИЕ ЗАЯВКИ ===
+function approveRequest(row, comment) {
+  try {
+    var sheet = SpreadsheetApp.getActive().getSheetByName(НАСТРОЙКИ.листРеестр);
+    var userEmail = Session.getActiveUser().getEmail();
+    sheet.getRange(row, 10).setValue("Согласовано");
+    sheet.getRange(row, 11).setValue(userEmail);
+    sheet.getRange(row, 12).setValue(new Date());
+    if (comment) sheet.getRange(row, 13).setValue(comment);
+    return { success: true };
+  } catch (error) {
+    return { success: false, message: error.toString() };
+  }
+}
+
+// === ОТКЛОНЕНИЕ ЗАЯВКИ ===
+function rejectRequest(row, comment) {
+  try {
+    if (!comment) return { success: false, message: "Укажите причину" };
+    var sheet = SpreadsheetApp.getActive().getSheetByName(НАСТРОЙКИ.листРеестр);
+    var userEmail = Session.getActiveUser().getEmail();
+    sheet.getRange(row, 10).setValue("Отклонено");
+    sheet.getRange(row, 11).setValue(userEmail);
+    sheet.getRange(row, 12).setValue(new Date());
+    sheet.getRange(row, 13).setValue("ОТКЛОНЕНО: " + comment);
+    return { success: true };
+  } catch (error) {
+    return { success: false, message: error.toString() };
+  }
+}
+
+// === ПРОВЕРКА ЯВЛЯЕТСЯ ЛИ ПОЛЬЗОВАТЕЛЬ РУКОВОДИТЕЛЕМ ===
+function checkIsBoss() {
+  try {
+    var userEmail = Session.getActiveUser().getEmail();
+    for (var i = 0; i < НАСТРОЙКИ.руководители.length; i++) {
+      if (НАСТРОЙКИ.руководители[i].toLowerCase() === userEmail.toLowerCase()) return true;
+    }
+    return false;
+  } catch (error) {
+    return false;
+  }
+}
+
+// === ПРОВЕРКА ПРАВ ===
+function checkUserPermissionsDetailed() {
+  var userEmail = Session.getActiveUser().getEmail();
+  var isBoss = false, isAcc = false;
+  for (var i = 0; i < НАСТРОЙКИ.руководители.length; i++) {
+    if (НАСТРОЙКИ.руководители[i].toLowerCase() === userEmail.toLowerCase()) isBoss = true;
+  }
+  for (var i = 0; i < НАСТРОЙКИ.бухгалтеры.length; i++) {
+    if (НАСТРОЙКИ.бухгалтеры[i].toLowerCase() === userEmail.toLowerCase()) isAcc = true;
+  }
+  SpreadsheetApp.getUi().alert('📋 Ваши права', 
+    'Email: ' + userEmail + '\n\n👑 Руководитель: ' + (isBoss ? '✅ ДА' : '❌ НЕТ') + 
+    '\n💰 Бухгалтер: ' + (isAcc ? '✅ ДА' : '❌ НЕТ'), 
+    SpreadsheetApp.getUi().ButtonSet.OK);
+}
+
+// === СНЯТИЕ ВСЕХ ЗАЩИТ ===
+function removeAllProtectionsCompletely() {
+  var ss = SpreadsheetApp.getActiveSpreadsheet();
+  var sheets = ss.getSheets();
+  for (var s = 0; s < sheets.length; s++) {
+    var sheet = sheets[s];
+    var protections = sheet.getProtections(SpreadsheetApp.ProtectionType.SHEET);
+    for (var i = 0; i < protections.length; i++) protections[i].remove();
+    var rangeProtections = sheet.getProtections(SpreadsheetApp.ProtectionType.RANGE);
+    for (var i = 0; i < rangeProtections.length; i++) rangeProtections[i].remove();
+  }
+  showAlert('✅ Защиты сняты');
+}
+
+// === УСЛОВНОЕ ФОРМАТИРОВАНИЕ ===
+function setupConditionalFormatting() {
+  var sheet = SpreadsheetApp.getActive().getSheetByName(НАСТРОЙКИ.листРеестр);
+  if (!sheet) return;
+  sheet.clearConditionalFormatRules();
+  var rules = [];
+  rules.push(SpreadsheetApp.newConditionalFormatRule().setRanges([sheet.getRange("A2:S")]).setBackground("#ffcdd2").whenFormulaSatisfied('=OR($J2="Отклонено", AND($J2="Согласовано", $N2<>"Оплачено", $B2<TODAY()))').build());
+  rules.push(SpreadsheetApp.newConditionalFormatRule().setRanges([sheet.getRange("A2:S")]).setBackground("#fff9c4").whenFormulaSatisfied('=AND($J2="Согласовано", $N2<>"Оплачено", $B2>=TODAY())').build());
+  rules.push(SpreadsheetApp.newConditionalFormatRule().setRanges([sheet.getRange("A2:S")]).setBackground("#c8e6c9").whenFormulaSatisfied('=$N2="Оплачено"').build());
+  rules.push(SpreadsheetApp.newConditionalFormatRule().setRanges([sheet.getRange("A2:S")]).setBackground("#bbdefb").whenFormulaSatisfied('=$J2="На согласовании"').build());
+  sheet.setConditionalFormatRules(rules);
+}
+
+function refreshColors() { setupConditionalFormatting(); showAlert('🎨 Цвета обновлены'); }
+
+// === ВЫПАДАЮЩИЕ СПИСКИ ===
+function setupDataValidation(sheet) {
+  try {
+    var lastRow = 2000;
+    sheet.getRange("J2:J" + lastRow).setDataValidation(SpreadsheetApp.newDataValidation().requireValueInList(["На согласовании", "Согласовано", "Отклонено"], true).build());
+    sheet.getRange("N2:N" + lastRow).setDataValidation(SpreadsheetApp.newDataValidation().requireValueInList(["Не оплачено", "Оплачено", "Частично"], true).build());
+    sheet.getRange("H2:H" + lastRow).setDataValidation(SpreadsheetApp.newDataValidation().requireValueInList(["RUB", "USD", "EUR", "CNY"], true).build());
+  } catch (error) {}
+}
+
+function forceUpdateDropdowns() {
+  var sheet = SpreadsheetApp.getActive().getSheetByName(НАСТРОЙКИ.листРеестр);
+  setupDataValidation(sheet);
+  showAlert('✅ Списки обновлены');
+}
+
+// === ТЕСТ DRIVE ===
+function testDriveAccess() {
+  try {
+    var testFolder = DriveApp.createFolder('Тест_' + new Date().getTime());
+    testFolder.setTrashed(true);
+    showAlert('✅ Доступ к Drive есть');
+  } catch (error) {
+    showAlert('❌ Ошибка доступа к Drive');
+  }
+}
+
+// === ПРОВЕРКА ДОСТУПА К ПАПКЕ ===
+function checkFolderAccess() {
+  try {
+    var userEmail = Session.getActiveUser().getEmail();
+    var message = '📧 ' + userEmail + '\n\n';
+    if (НАСТРОЙКИ.корневаяПапка) {
+      try {
+        var folder = DriveApp.getFolderById(НАСТРОЙКИ.корневаяПапка);
+        message += '✅ Папка найдена: ' + folder.getName();
+      } catch (e) {
+        message += '❌ Папка не найдена';
+      }
+    } else {
+      message += 'ℹ️ Папка не указана';
+    }
+    SpreadsheetApp.getUi().alert('📁 Проверка папки', message, SpreadsheetApp.getUi().ButtonSet.OK);
+  } catch (error) {}
+}
+
+// === ДАШБОРД ===
+function createOrUpdateDashboard() {
+  var ss = SpreadsheetApp.getActive();
+  var dashboard = ss.getSheetByName("Дашборд");
+  if (dashboard) dashboard.clear();
+  else dashboard = ss.insertSheet("Дашборд");
+  var data = [
+    ['📊 ДАШБОРД', ''], 
+    ['Обновлено: ', '=TEXT(NOW(), "DD.MM.YYYY HH:MM")'], 
+    ['', ''],
+    ['Всего заявок', '=COUNTA(Реестр!A:A)-1'],
+    ['На согласовании', '=COUNTIF(Реестр!J:J, "На согласовании")'],
+    ['Согласовано', '=COUNTIF(Реестр!J:J, "Согласовано")'],
+    ['Отклонено', '=COUNTIF(Реестр!J:J, "Отклонено")']
+  ];
+  dashboard.getRange(1, 1, data.length, 2).setValues(data);
+  dashboard.getRange('A:A').setFontWeight('bold');
+  showAlert('📊 Дашборд создан');
+}
+
+// === ВСПОМОГАТЕЛЬНЫЕ ===
+function showAlert(title, message) {
+  try { SpreadsheetApp.getUi().alert(title, message || '', SpreadsheetApp.getUi().ButtonSet.OK); } catch(e) {}
+}
+
+function showHelp() {
+  var html = '<html><body style="padding:20px;font-family:Arial">' +
+    '<h2>📋 Помощь</h2>' +
+    '<div style="background:#fff3cd;padding:10px;border-radius:5px;margin:10px 0">' +
+    '<b>⚠️ ПЕРВЫЙ ЗАПУСК:</b><br>' +
+    '1. Нажмите "🔐 АВТОРИЗАЦИЯ (ОБЯЗАТЕЛЬНО!)"<br>' +
+    '2. Разрешите доступ<br>' +
+    '3. После успеха можно создавать заявки</div>' +
+    '<h3>👑 Руководители:</h3>' +
+    '<p>vovaeroklinzev@gmail.com<br>eroklintsev91@gmail.com<br>m.kostenko0209@gmail.com</p>' +
+    '<h3>🎨 Цвета:</h3>' +
+    '<p>🟢 Оплачено | 🟡 Ожидает | 🔴 Просрочка | 🔵 На согласовании</p>' +
+    '</body></html>';
+  SpreadsheetApp.getUi().showModalDialog(HtmlService.createHtmlOutput(html).setWidth(450).setHeight(400), 'Помощь');
+}
+
+// === ИНИЦИАЛИЗАЦИЯ СИСТЕМЫ ===
+function initializeSystem() {
+  var ss = SpreadsheetApp.getActiveSpreadsheet();
+  var sheet = ss.getSheetByName(НАСТРОЙКИ.листРеестр);
+  if (!sheet) sheet = ss.insertSheet(НАСТРОЙКИ.листРеестр);
+  if (sheet.getLastRow() == 0) initializeNewSheet(sheet);
+  sheet.hideColumns(17);
+  setupDataValidation(sheet);
+  setupConditionalFormatting();
+  refreshCurrencyRates();
+  createOrUpdateDashboard();
+  removeAllProtectionsCompletely();
+  showAlert('✅ Система инициализирована', 'Нажмите "🔐 АВТОРИЗАЦИЯ" для первого запуска');
+}
+
+// === ОТКРЫТЬ ПАПКУ ===
+function openDriveFolder() {
+  if (НАСТРОЙКИ.корневаяПапка) {
+    var url = 'https://drive.google.com/drive/folders/' + НАСТРОЙКИ.корневаяПапка;
+    var html = '<script>window.open("' + url + '"); google.script.host.close();</script>';
+    SpreadsheetApp.getUi().showModalDialog(HtmlService.createHtmlOutput(html).setWidth(100).setHeight(100), 'Открытие папки');
+  }
+}
+
+// === ОБРАБОТКА ИЗМЕНЕНИЙ ===
+function onEdit(e) {
+  var range = e.range;
+  var sheet = range.getSheet();
+  var row = range.getRow();
+  var col = range.getColumn();
+  if (sheet.getName() != НАСТРОЙКИ.листРеестр || row == 1) return;
+  var userEmail = Session.getActiveUser().getEmail();
+  if (col == 10) {
+    sheet.getRange(row, 11).setValue(userEmail);
+    sheet.getRange(row, 12).setValue(new Date());
+  }
+  if (col == 14 && range.getValue() == "Оплачено") {
+    sheet.getRange(row, 15).setValue(new Date());
+  }
+  if (col == 7 || col == 8) {
+    Utilities.sleep(100);
+    addRubFormula(row);
+  }
+}
