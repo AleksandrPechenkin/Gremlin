@@ -1,3 +1,12 @@
+/**
+ * Работа с кодом (договорённость с ассистентом / владельцем):
+ * — В Google Apps Script каждый модуль переносится целиком: открыть файл .gs в этой папке
+ *   проекта → выделить всё → вставить в соответствующий файл редактора скриптов → сохранить.
+ *   Не собирать код из фрагментов в чате.
+ * — Актуальные версии файлов — в папке проекта на диске; полный выклад файла в переписку
+ *   не обязателен, если не попросили отдельно.
+ * Подробнее для ассистента: PROJECT_CONTEXT.md
+ */
 const SHEET_NAME = 'Сводная';
 
 const COL = {
@@ -42,6 +51,14 @@ function onOpen() {
   if (typeof addSenderStockMenu_ === 'function') {
     addSenderStockMenu_(ui);
   }
+  ui.createMenu('Планирование закупок')
+    .addItem('Подтянуть планы продаж на лист «Планирование закупок»', 'refreshProcurementPlanningFromSalesSheets')
+    .addItem('Обновить лист «Склады МС (остатки)» из МойСклад', 'syncMsStockStoresSheet')
+    .addItem('Записать учётный остаток МС на «Планирование закупок»', 'updateProcurementPlanningMsAccountingStock')
+    .addItem('Записать остаток WB на «Планирование закупок»', 'updateProcurementPlanningWbStock')
+    .addItem('Рассчитать потребность закупки (остатки + в пути + продажи)', 'computeProcurementPurchasePlan')
+    .addItem('Проверить сопоставление остатков (артикул/ШК)', 'checkProcurementPlanningStocksCoverage')
+    .addToUi();
 }
 
 function syncOrdersWithMS() {

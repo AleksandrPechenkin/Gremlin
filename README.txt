@@ -3,15 +3,38 @@
 - payments_sync.gs: перенос оплат в таблицу "Закуплено"
 - moysklad_api.gs: авторизация, HTTP-методы, обработка ошибок API
 - helpers.gs: общие функции (даты, числа, строки, атрибуты)
+- procurement_planning.gs: свод планов продаж («Заказали, шт») по «Артикул ВБ» на лист «Планирование закупок»; ШК и наименование (артикул поставщика) из справочника товаров; месяцы — округление вверх до коробки (шт/кор, по умолчанию колонка T); лист «Склады МС (остатки)» (syncMsStockStoresSheet); учётный остаток МС на планировании (updateProcurementPlanningMsAccountingStock — в расчёт только артикулы ВБ и ШК из строк плана, поле stock, склады с «Использовать»); остаток WB (updateProcurementPlanningWbStock — см. wildberries_stocks.gs); проверка сопоставления остатков по артикулу/ШК (checkProcurementPlanningStocksCoverage)
+- procurement_planning.gs: свод планов продаж («Заказали, шт») по «Артикул ВБ» на лист «Планирование закупок»; ШК и наименование (артикул поставщика) из справочника товаров; месяцы — округление вверх до коробки (шт/кор, по умолчанию колонка T); лист «Склады МС (остатки)» (syncMsStockStoresSheet); учётный остаток МС на планировании (updateProcurementPlanningMsAccountingStock — в расчёт только артикулы ВБ и ШК из строк плана, поле stock, склады с «Использовать»); остаток WB (updateProcurementPlanningWbStock — см. wildberries_stocks.gs); проверка сопоставления остатков по артикулу/ШК (checkProcurementPlanningStocksCoverage); расчёт потребности закупки с выгрузкой детализированной таблицы (computeProcurementPurchasePlan)
+- wildberries_stocks.gs: остатки Wildberries для планирования (отчёт warehouse_remains на seller-analytics-api или supplier/stocks на statistics-api; токен WB_API_TOKEN; свойства WB_STOCK_SOURCE, базовые URL — в комментарии в начале файла)
+- wb_sales.gs: факт продаж WB текущего месяца (statistics API /api/v1/supplier/sales) для корректировки плана месяца в расчёте закупки
 
 Обязательные Script Properties:
 - MS_TOKEN
 - MS_ORGANIZATION_ID
 - EXTERNAL_SPREADSHEET_ID
 
+Для остатков WB на листе планирования (по желанию):
+- WB_API_TOKEN — токен продавца WB («Аналитика» для warehouse_remains, «Статистика» для supplier/stocks; в режиме auto сначала analytics)
+
 Опциональные Script Properties:
 - MS_STORE_ID
 - EXTERNAL_SHEET_NAME (по умолчанию: Закуплено)
+- SALES_PLANS_SPREADSHEET_ID (книга с «Проставление планов …»; в коде есть ID по умолчанию)
+- SALES_PLANS_SHEET_GREMLIN, SALES_PLANS_SHEET_OBSHCHIY, SALES_PLANS_SHEET_DEPT3 — не трогать, пока листы в книге отделов не переименовывают (на имена завязаны другие скрипты); свойства — только при осознанном переименовании везде
+- SALES_PLANS_EXTRA_SPREADSHEET_ID — вторая книга с планом (в коде ID по умолчанию); пусто или OFF — не подмешивать
+- SALES_PLANS_EXTRA_SHEET_NAME — лист во второй книге (по умолчанию: Проставление планов)
+- PROCUREMENT_PLANNING_SHEET (куда писать свод; по умолчанию: Планирование закупок)
+- PROCUREMENT_PLANNING_YEAR, PROCUREMENT_PLANNING_MONTHS (например 2026 и «5,6,7,8» для мая–августа)
+- PRODUCT_REFERENCE_SPREADSHEET_ID, PRODUCT_REFERENCE_SHEET_NAME (как в инвойсах; в коде есть значения по умолчанию)
+- PRODUCT_REFERENCE_PCS_PER_BOX_COL (номер колонки «шт в коробке» в справочнике; по умолчанию 20 = T)
+- MS_STOCK_STORES_SHEET (имя листа перечня складов для остатков; по умолчанию: Склады МС (остатки))
+- MS_STORE_SYNC_INCLUDE_ARCHIVED (1 — подтягивать и архивные склады МС; по умолчанию только неархивные)
+- WB_STOCK_SOURCE (analytics | statistics | auto — по умолчанию auto)
+- WB_ANALYTICS_API_BASE, WB_STATISTICS_API_BASE (редко нужны; см. wildberries_stocks.gs)
+- WB_STOCK_USE_QUANTITY_FULL (1 — в режиме statistics суммировать quantityFull вместо quantity)
+- PROCUREMENT_SHIPPED_STATUS_CODE (по умолчанию S13_IN_TRANSIT_MOSCOW — статус «отгружен» для гибридной логики in-transit)
+- PROCUREMENT_PURCHASE_REPORT_SHEET (лист детализации расчёта закупки; по умолчанию: Планирование закупок (расчёт))
+- PROCUREMENT_TARGET_CONTROL_MONTH (контрольный месяц для двух срезов, формат YYYY-MM; по умолчанию последний месяц горизонта)
 
 ---
 Синхронизация с облаком
