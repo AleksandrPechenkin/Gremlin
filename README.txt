@@ -1,4 +1,5 @@
 Структура проекта:
+- sync_hub.gs: синхронизация между книгами 01–05; меню «Синхронизация книг»; лист SYNC_LOG в книге 04 (MASTER_REF_SPREADSHEET_ID). Реестр: ORDERS_SPREADSHEET_ID (01), TRANSIT_SPREADSHEET_ID (02), PROCUREMENT_SPREADSHEET_ID (03), COST_SPREADSHEET_ID (05); если скрипт запускается из книги 01 и ORDERS_SPREADSHEET_ID пуст — для 01 подставляется текущий файл (но не когда активна книга 04: тогда задайте ORDERS_SPREADSHEET_ID явно)
 - main.gs: основная синхронизация заказов с МойСклад
 - payments_sync.gs: перенос оплат в таблицу "Закуплено"
 - moysklad_api.gs: авторизация, HTTP-методы, обработка ошибок API
@@ -17,6 +18,8 @@
 - WB_API_TOKEN — токен продавца WB («Аналитика» для warehouse_remains, «Статистика» для supplier/stocks; в режиме auto сначала analytics)
 
 Опциональные Script Properties:
+- ORDERS_SPREADSHEET_ID — ID книги 01 (заказы); для хаба в 04 обязательно; в книге 01 можно не задавать, если совпадает с текущим файлом
+- MASTER_REF_SPREADSHEET_ID, TRANSIT_SPREADSHEET_ID, PROCUREMENT_SPREADSHEET_ID, COST_SPREADSHEET_ID — см. sync_hub.gs (синхронизация между книгами)
 - MS_STORE_ID
 - EXTERNAL_SHEET_NAME (по умолчанию: Закуплено)
 - SALES_PLANS_SPREADSHEET_ID (книга с «Проставление планов …»; в коде есть ID по умолчанию)

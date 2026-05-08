@@ -1,6 +1,17 @@
+/**
+ * Sync Hub: обмен между книгами 01–05. Журнал по умолчанию пишется в книгу 04 (MASTER_REF_SPREADSHEET_ID).
+ *
+ * Реестр книг (Script Properties проекта, куда вставлен sync_hub.gs):
+ *   MASTER_REF_SPREADSHEET_ID — книга 04 (справочники + SYNC_LOG)
+ *   ORDERS_SPREADSHEET_ID     — книга 01 (заказы); если пусто и активная книга ≠ 04 — берётся текущий файл
+ *   TRANSIT_SPREADSHEET_ID   — книга 02
+ *   PROCUREMENT_SPREADSHEET_ID — книга 03
+ *   COST_SPREADSHEET_ID      — книга 05
+ */
 const SYNC_HUB_CFG = {
   PROPS: {
     MASTER_REF_SPREADSHEET_ID: 'MASTER_REF_SPREADSHEET_ID',
+    ORDERS_SPREADSHEET_ID: 'ORDERS_SPREADSHEET_ID',
     TRANSIT_SPREADSHEET_ID: 'TRANSIT_SPREADSHEET_ID',
     PROCUREMENT_SPREADSHEET_ID: 'PROCUREMENT_SPREADSHEET_ID',
     COST_SPREADSHEET_ID: 'COST_SPREADSHEET_ID',
@@ -42,6 +53,7 @@ const SYNC_HUB_CFG = {
 function addSyncHubMenu_(ui) {
   ui.createMenu('🔁 Синхронизация книг')
     .addItem('Проверить настройки синхронизации', 'syncHubHealthCheck')
+    .addItem('Реестр книг 01–05 (Script Properties)', 'syncHubShowBookRegistry_')
     .addItem('Показать листы книги 04 (диагностика)', 'syncHubShowMasterSheets_')
     .addSeparator()
     .addItem('Синхронизировать справочники (из 04)', 'syncMasterRefsFrom04_')
@@ -66,7 +78,96 @@ function syncHubHealthCheck() {
     );
     return;
   }
-  ui.alert('✅ Проверка пройдена', 'Базовые настройки синхронизации заполнены.', ui.ButtonSet.OK);
+  const lines = syncHubFormatBookRegistryLines_(true);
+  ui.alert(
+    '✅ Проверка пройдена',
+    'Базовые настройки синхронизации заполнены.\n\n' + lines.join('\n'),
+    ui.ButtonSet.OK
+  );
+}
+
+/**
+ * Строки для UI: код книги, имя свойства, статус (заполнено / пусто / текущий файл как 01).
+ * @param {boolean} shortIds если true — показывать только часть id
+ */
+function syncHubFormatBookRegistryLines_(shortIds) {
+  const rows = syncHubGetBookRegistryMeta_();
+  const out = [];
+  for (let i = 0; i < rows.length; i++) {
+    const r = rows[i];
+    const resolved = syncHubResolveSpreadsheetIdForBook_(r.code, { forDisplay: true });
+    let idDisp = resolved.id || '(пусто)';
+    if (shortIds && resolved.id && resolved.id.length > 18) {
+      idDisp = resolved.id.slice(0, 6) + '…' + resolved.id.slice(-6);
+    }
+    out.push(r.code + ' ' + r.title + ' | ' + r.prop + ' | ' + resolved.note + (resolved.id ? ' | ' + idDisp : ''));
+  }
+  return out;
+}
+
+function syncHubGetBookRegistryMeta_() {
+  return [
+    { code: '01', title: 'Заказы', prop: SYNC_HUB_CFG.PROPS.ORDERS_SPREADSHEET_ID },
+    { code: '02', title: 'Транзит', prop: SYNC_HUB_CFG.PROPS.TRANSIT_SPREADSHEET_ID },
+    { code: '03', title: 'Закупки', prop: SYNC_HUB_CFG.PROPS.PROCUREMENT_SPREADSHEET_ID },
+    { code: '04', title: 'Справочники/хаб', prop: SYNC_HUB_CFG.PROPS.MASTER_REF_SPREADSHEET_ID },
+    { code: '05', title: 'Рейсы/себестоимость', prop: SYNC_HUB_CFG.PROPS.COST_SPREADSHEET_ID }
+  ];
+}
+
+/**
+ * Разрешить Spreadsheet ID по коду книги 01|02|03|04|05.
+ * Для 01: если ORDERS_SPREADSHEET_ID пуст, подставляется текущая книга только если она не совпадает с 04 (иначе пусто — задайте ORDERS_SPREADSHEET_ID в хабе).
+ */
+function syncHubResolveSpreadsheetIdForBook_(bookCode, options) {
+  const c = String(bookCode || '').trim();
+  const forDisplay = !!(options && options.forDisplay);
+  const masterId = syncHubGetProp_(SYNC_HUB_CFG.PROPS.MASTER_REF_SPREADSHEET_ID, '');
+  const activeId = SpreadsheetApp.getActiveSpreadsheet().getId();
+
+  if (c === '04') {
+    if (!masterId) return { id: '', note: forDisplay ? 'НЕ ЗАДАН 04' : 'MISSING' };
+    return { id: masterId, note: '04' };
+  }
+  if (c === '01') {
+    const explicit = syncHubGetProp_(SYNC_HUB_CFG.PROPS.ORDERS_SPREADSHEET_ID, '');
+    if (explicit) return { id: explicit, note: '01 явный' };
+    if (masterId && activeId === masterId) {
+      return { id: '', note: forDisplay ? 'Задайте ORDERS_SPREADSHEET_ID (хаб 04 ≠ книга 01)' : 'MISSING_01' };
+    }
+    return { id: activeId, note: '01 текущий файл' };
+  }
+  if (c === '02') {
+    const id = syncHubGetProp_(SYNC_HUB_CFG.PROPS.TRANSIT_SPREADSHEET_ID, '');
+    return { id: id, note: id ? '02' : (forDisplay ? '02 не задан' : 'MISSING') };
+  }
+  if (c === '03') {
+    const id = syncHubGetProp_(SYNC_HUB_CFG.PROPS.PROCUREMENT_SPREADSHEET_ID, '');
+    return { id: id, note: id ? '03' : (forDisplay ? '03 не задан' : 'MISSING') };
+  }
+  if (c === '05') {
+    const id = syncHubGetProp_(SYNC_HUB_CFG.PROPS.COST_SPREADSHEET_ID, '');
+    return { id: id, note: id ? '05' : (forDisplay ? '05 не задан' : 'MISSING') };
+  }
+  throw new Error('Неизвестный код книги: ' + bookCode);
+}
+
+function syncHubOpenSpreadsheetForBook_(bookCode) {
+  const r = syncHubResolveSpreadsheetIdForBook_(bookCode, {});
+  if (!r.id) {
+    throw new Error('Не задан Spreadsheet ID для книги ' + bookCode + ' (' + r.note + ')');
+  }
+  return SpreadsheetApp.openById(r.id);
+}
+
+function syncHubShowBookRegistry_() {
+  const ui = SpreadsheetApp.getUi();
+  const lines = syncHubFormatBookRegistryLines_(false);
+  ui.alert(
+    'Реестр книг (Script Properties)',
+    lines.join('\n'),
+    ui.ButtonSet.OK
+  );
 }
 
 function syncAllExternalBooks_() {
