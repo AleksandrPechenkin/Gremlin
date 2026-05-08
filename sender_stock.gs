@@ -195,7 +195,7 @@ function buildStockEventsFromSheet_(sheet, statusEventMap) {
 
     const qty = toNumStock_(r[idxQty]);
     const article = String(r[idxArticle] || '').trim();
-    const sender = String(r[idxSender] || '').trim();
+    const sender = normalizeShipViaForStock_(String(r[idxSender] || '').trim());
     if (!sender) { stats.noSender++; continue; }
     if (!article) { stats.noArticle++; continue; }
     if (!(qty > 0)) { stats.noQty++; continue; }
@@ -348,6 +348,38 @@ function canonStock_(v) {
     .trim();
 }
 
+/** Подпись для «Отгрузка через», когда груз без вашего транзитного узла (прямая отгрузка с фабрики). */
+const SHIP_VIA_NO_TRANSIT_CANON_ = 'Не транзит (прямая с фабрики)';
+
+/** Приводит варианты вроде «условно не транзит» к одной строке для остатков и прогноза. */
+function normalizeShipViaForStock_(raw) {
+  const t = String(raw || '').trim();
+  if (!t) return '';
+  const k = canonStock_(t);
+  if (!k) return '';
+  if (shipViaNoTransitKeys_()[k]) return SHIP_VIA_NO_TRANSIT_CANON_;
+  return t;
+}
+
+function shipViaNoTransitKeys_() {
+  if (shipViaNoTransitKeys_.cache) return shipViaNoTransitKeys_.cache;
+  const labels = [
+    SHIP_VIA_NO_TRANSIT_CANON_,
+    'условно не транзит',
+    'не транзит',
+    'прямая с фабрики',
+    'без транзита',
+    'direct from factory'
+  ];
+  const map = {};
+  for (let i = 0; i < labels.length; i++) {
+    const key = canonStock_(labels[i]);
+    if (key) map[key] = true;
+  }
+  shipViaNoTransitKeys_.cache = map;
+  return map;
+}
+
 function toNumStock_(v) {
   if (typeof v === 'number') return isFinite(v) ? v : 0;
   const s = String(v || '').replace(/\s/g, '').replace(',', '.');
@@ -498,7 +530,7 @@ function buildShipmentForecastFromReadyDate() {
 
   const agg = {};
   data.forEach(function (r, i) {
-    const senderRaw = String(r[idxSender] || '').trim();
+    const senderRaw = normalizeShipViaForStock_(String(r[idxSender] || '').trim());
     const senderKey = senderRaw || '\u0000__NO_SENDER__';
     const senderOut = senderRaw || FORECAST_SENDER_EMPTY_;
 

@@ -51,6 +51,9 @@ function onOpen() {
   if (typeof addSenderStockMenu_ === 'function') {
     addSenderStockMenu_(ui);
   }
+  if (typeof addSyncHubMenu_ === 'function') {
+    addSyncHubMenu_(ui);
+  }
   ui.createMenu('Планирование закупок')
     .addItem('Подтянуть планы продаж на лист «Планирование закупок»', 'refreshProcurementPlanningFromSalesSheets')
     .addItem('Обновить лист «Склады МС (остатки)» из МойСклад', 'syncMsStockStoresSheet')

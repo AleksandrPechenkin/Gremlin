@@ -57,6 +57,25 @@ function payNorm_(v) {
   return String(v || '').trim();
 }
 
+function payQueueId_() {
+  const ts = Utilities.formatDate(new Date(), Session.getScriptTimeZone(), 'yyyyMMdd-HHmmss-SSS');
+  const rnd = Math.floor(Math.random() * 1000);
+  return 'PRQ-' + ts + '-' + String(rnd).padStart(3, '0');
+}
+
+function payQueueSignatureFromRow_(r) {
+  // Устойчивая сигнатура дубликата: без суммы/срока, чтобы не зависеть от форматов.
+  // manager_sheet|manager_name|spec|payment_type|percent|counterparty
+  return [
+    payCanon_(r[3]),
+    payCanon_(r[4]),
+    payCanon_(r[5]),
+    payCanon_(r[6]),
+    String(r[7] == null ? '' : r[7]),
+    payCanon_(r[8])
+  ].join('|');
+}
+
 function payCanon_(v) {
   return payNorm_(v).toLowerCase().replace(/\s+/g, '');
 }
@@ -150,20 +169,53 @@ function payManagerDialogHtml_(specs, counterparties) {
     '</select></div>' +
     '<div class="row"><label>Тип оплаты</label><select id="ptype"><option>Аванс</option><option>Баланс</option><option>Отсрочка</option></select></div>' +
     '<div class="row"><label>Размер оплаты, %</label><input id="percent" type="number" min="0" max="100" value="20"></div>' +
+    '<div class="row"><label>Валюта заявки</label><select id="currency"><option value="CNY" selected>CNY</option><option value="USD">USD</option><option value="EUR">EUR</option><option value="RUB">RUB</option></select></div>' +
     '<div class="row"><label>Оплатить до</label><input id="due" type="date"></div>' +
     '<div class="row"><label>Контрагент (обязательно)</label><input id="counterparty" list="cpList" placeholder="Введите или выберите"></div>' +
     '<datalist id="cpList">' +
     counterparties.map(function (c) { return '<option value="' + c + '"></option>'; }).join('') +
     '</datalist>' +
     '<div class="row"><label>Подписанный документ (обязательно)</label><input id="files" type="file" multiple></div>' +
-    '<div class="row"><button onclick="send()">Отправить на проверку</button></div>' +
-    '<script>function toB64(f){return new Promise((res,rej)=>{const r=new FileReader();r.onload=()=>res(String(r.result).split(\",\")[1]);r.onerror=rej;r.readAsDataURL(f);});}' +
-    'async function send(){const spec=document.getElementById(\"spec\").value;const ptype=document.getElementById(\"ptype\").value;const pct=document.getElementById(\"percent\").value;const due=document.getElementById(\"due\").value;const cp=document.getElementById(\"counterparty\").value;' +
-    'const fs=[...document.getElementById(\"files\").files];if(!cp){alert(\"Контрагент обязателен\");return;}if(!fs.length){alert(\"Нужен подписанный документ\");return;}' +
-    'const files=[];for(const f of fs){files.push({name:f.name,type:f.type||\"application/octet-stream\",data:await toB64(f)});}' +
-    'google.script.run.withSuccessHandler(function(msg){alert(msg);google.script.host.close();}).withFailureHandler(function(e){alert(e.message||e);}).paySubmitManagerRequest({spec:spec,paymentType:ptype,percent:pct,dueDate:due,counterparty:cp},files);}</script>' +
+    '<div class="row"><button id="sendBtn" onclick="send()">Отправить на проверку</button></div>' +
+    '<p style="font-size:12px;color:#555">Крупные файлы отправляются частями (без одного большого запроса).</p>' +
+    '<script>var sending=false;var CHUNK=450000;' +
+    'function toB64(f){return new Promise(function(res,rej){var r=new FileReader();r.onload=function(){res(String(r.result).split(\",\")[1]);};r.onerror=rej;r.readAsDataURL(f);});}' +
+    'function runPrepare(payload){return new Promise(function(ok,er){google.script.run.withSuccessHandler(ok).withFailureHandler(er).payManagerDialogPrepare(payload);});}' +
+    'function runChunk(token,folderId,fi,ci,total,name,mime,part){return new Promise(function(ok,er){google.script.run.withSuccessHandler(ok).withFailureHandler(er).payManagerDialogUploadChunk(token,folderId,fi,ci,total,name,mime,part);});}' +
+    'function runFinalize(token,folderId){return new Promise(function(ok,er){google.script.run.withSuccessHandler(ok).withFailureHandler(er).payManagerDialogFinalize(token,folderId);});}' +
+    'async function send(){var spec=document.getElementById(\"spec\").value;var ptype=document.getElementById(\"ptype\").value;var pct=document.getElementById(\"percent\").value;var currency=document.getElementById(\"currency\").value;var due=document.getElementById(\"due\").value;var cp=document.getElementById(\"counterparty\").value;' +
+    'var fs=[].slice.call(document.getElementById(\"files\").files);if(!cp){alert(\"Контрагент обязателен\");return;}if(!fs.length){alert(\"Нужен подписанный документ\");return;}if(sending)return;sending=true;document.getElementById(\"sendBtn\").disabled=true;' +
+    'try{var payload={spec:spec,paymentType:ptype,percent:pct,currency:currency,dueDate:due,counterparty:cp};var prep=await runPrepare(payload);' +
+    'for(var fi=0;fi<fs.length;fi++){var b64=await toB64(fs[fi]);var total=Math.max(1,Math.ceil(b64.length/CHUNK));' +
+    'for(var ci=0;ci<total;ci++){var part=b64.substring(ci*CHUNK,(ci+1)*CHUNK);await runChunk(prep.uploadToken,prep.folderId,fi,ci,total,fs[fi].name,fs[fi].type||\'application/octet-stream\',part);}}' +
+    'var msg=await runFinalize(prep.uploadToken,prep.folderId);alert(msg);google.script.host.close();}catch(e){alert(e.message||e);}finally{sending=false;document.getElementById(\"sendBtn\").disabled=false;}}</script>' +
     '</body></html>'
   );
+}
+
+/**
+ * Точки входа для google.script.run из формы менеджера.
+ * Функции с суффиксом `_*` в ряде окружений не отдаются клиенту — вызов даёт "is not a function".
+ */
+function payManagerDialogPrepare(payload) {
+  return payPrepareManagerRequest_(payload);
+}
+
+function payManagerDialogUploadChunk(uploadToken, folderId, fileIndex, chunkIndex, totalChunks, fileName, mimeType, base64Chunk) {
+  payUploadManagerFileChunk_(
+    uploadToken,
+    folderId,
+    fileIndex,
+    chunkIndex,
+    totalChunks,
+    fileName,
+    mimeType,
+    base64Chunk
+  );
+}
+
+function payManagerDialogFinalize(uploadToken, folderId) {
+  return payFinalizeManagerRequest_(uploadToken, folderId);
 }
 
 function payEnsureQueueSheet_() {
@@ -183,19 +235,35 @@ function payEnsureQueueSheet_() {
   return sh;
 }
 
-function paySubmitManagerRequest(payload, files) {
-  const ui = SpreadsheetApp.getUi();
+/**
+ * Подготовка черновика заявки: папка на Drive + meta JSON. Файлы грузятся отдельными вызовами (чанки), чтобы не упираться в HTTP 413.
+ */
+function payPrepareManagerRequest_(payload) {
+  const bundle = payManagerRequestBuildDraft_(payload);
+  const metaBlob = Utilities.newBlob(
+    JSON.stringify(bundle.meta),
+    'application/json',
+    '__pay_upload_meta.json'
+  );
+  bundle.folder.createFile(metaBlob);
+  return { uploadToken: bundle.queueId, folderId: bundle.folder.getId(), queueId: bundle.queueId };
+}
+
+function payManagerRequestBuildDraft_(payload) {
   const sheet = SpreadsheetApp.getActiveSheet();
   const managerSheetName = sheet.getName();
   const managerName = payManagerNameFromSheet_(managerSheetName);
   const spec = payNorm_(payload.spec);
   const pType = payNorm_(payload.paymentType);
   const pct = parseFloat(payload.percent);
+  const currency = payNorm_(payload.currency || 'CNY').toUpperCase();
   const counterparty = payNorm_(payload.counterparty);
   if (!spec || !pType || !isFinite(pct) || pct <= 0 || pct > 100 || !counterparty) {
     throw new Error('Проверьте обязательные поля заявки.');
   }
-  if (!files || !files.length) throw new Error('Нужно приложить подписанный документ.');
+  if (!/^[A-Z]{3}$/.test(currency)) {
+    throw new Error('Некорректная валюта заявки.');
+  }
 
   const lastCol = Math.max(sheet.getLastColumn(), 30);
   const lastRow = sheet.getLastRow();
@@ -217,29 +285,215 @@ function paySubmitManagerRequest(payload, files) {
   if (!matchedRows.length) throw new Error('По выбранной спецификации не найдены строки менеджера.');
 
   const amount = +(baseAmount * pct / 100).toFixed(2);
-  const queueId = 'PRQ-' + Utilities.formatDate(new Date(), Session.getScriptTimeZone(), 'yyyyMMdd-HHmmss');
-
+  const queueId = payQueueId_();
   const root = payGetDraftRootFolder_();
   const folder = root.createFolder(queueId + ' - ' + counterparty);
+  const createdBy = Session.getActiveUser().getEmail() || '';
+  const meta = {
+    v: 1,
+    queueId: queueId,
+    createdBy: createdBy,
+    managerSheetName: managerSheetName,
+    managerName: managerName,
+    spec: spec,
+    paymentType: pType,
+    percent: pct,
+    counterparty: counterparty,
+    amount: amount,
+    currency: currency,
+    dueDate: payload.dueDate ? String(payload.dueDate) : '',
+    matchedRows: matchedRows
+  };
+  return { queueId: queueId, folder: folder, meta: meta };
+}
+
+function payUploadManagerFileChunk_(uploadToken, folderId, fileIndex, chunkIndex, totalChunks, fileName, mimeType, base64Chunk) {
+  const folder = DriveApp.getFolderById(folderId);
+  payAssertUploadMeta_(folder, uploadToken);
+  const fi = Number(fileIndex);
+  const ci = Number(chunkIndex);
+  const tc = Number(totalChunks);
+  if (!isFinite(fi) || fi < 0 || !isFinite(ci) || ci < 0 || !isFinite(tc) || tc < 1) {
+    throw new Error('Некорректные параметры загрузки файла.');
+  }
+  if (ci === 0) {
+    payTrashFileByName_(folder, '__fileinfo_f' + fi + '.json');
+    const infoBlob = Utilities.newBlob(
+      JSON.stringify({ name: fileName || 'file', mimeType: mimeType || 'application/octet-stream', totalChunks: tc }),
+      'application/json',
+      '__fileinfo_f' + fi + '.json'
+    );
+    folder.createFile(infoBlob);
+  }
+  const partName = '__part_f' + fi + '_c' + ci + '.b64';
+  payTrashFileByName_(folder, partName);
+  folder.createFile(Utilities.newBlob(String(base64Chunk || ''), 'text/plain', partName));
+}
+
+function payTrashFileByName_(folder, name) {
+  const it = folder.getFilesByName(name);
+  while (it.hasNext()) {
+    it.next().setTrashed(true);
+  }
+}
+
+function payFinalizeManagerRequest_(uploadToken, folderId) {
+  const folder = DriveApp.getFolderById(folderId);
+  const meta = payReadUploadMeta_(folder);
+  if (!meta || payNorm_(meta.queueId) !== payNorm_(uploadToken)) {
+    throw new Error('Сессия загрузки недействительна или устарела.');
+  }
+
+  const files = folder.getFiles();
+  const fileInfoByIdx = {};
+  const partsByFile = {};
+  while (files.hasNext()) {
+    const f = files.next();
+    const n = f.getName();
+    const mInfo = /^__fileinfo_f(\d+)\.json$/i.exec(n);
+    if (mInfo) {
+      const idx = parseInt(mInfo[1], 10);
+      const txt = f.getBlob().getDataAsString();
+      try {
+        fileInfoByIdx[idx] = JSON.parse(txt);
+      } catch (e) {
+        throw new Error('Повреждены служебные данные загрузки.');
+      }
+      continue;
+    }
+    const mPart = /^__part_f(\d+)_c(\d+)\.b64$/i.exec(n);
+    if (mPart) {
+      const fi = parseInt(mPart[1], 10);
+      const ci = parseInt(mPart[2], 10);
+      if (!partsByFile[fi]) partsByFile[fi] = {};
+      partsByFile[fi][ci] = f.getBlob().getDataAsString();
+    }
+  }
+
+  const idxs = Object.keys(fileInfoByIdx)
+    .map(function (x) {
+      return parseInt(x, 10);
+    })
+    .filter(function (n) {
+      return isFinite(n);
+    })
+    .sort(function (a, b) {
+      return a - b;
+    });
+  if (!idxs.length) throw new Error('Нет загруженных файлов (чанки не найдены).');
+
   const fileLinks = [];
-  files.forEach(function (f) {
-    const blob = Utilities.newBlob(Utilities.base64Decode(f.data), f.type || 'application/octet-stream', f.name || 'file');
+  for (let k = 0; k < idxs.length; k++) {
+    const fi = idxs[k];
+    const info = fileInfoByIdx[fi];
+    const tc = info && info.totalChunks ? parseInt(info.totalChunks, 10) : 0;
+    const name = info && info.name ? info.name : 'file';
+    const mime = info && info.mimeType ? info.mimeType : 'application/octet-stream';
+    if (!tc || tc < 1) throw new Error('Некорректная мета файла: ' + name);
+
+    const chunks = partsByFile[fi];
+    if (!chunks) throw new Error('Нет данных для файла: ' + name);
+
+    let joined = '';
+    for (let c = 0; c < tc; c++) {
+      const piece = chunks[c];
+      if (piece == null) throw new Error('Неполная загрузка файла (нет части ' + c + '): ' + name);
+      joined += piece;
+    }
+
+    const blob = Utilities.newBlob(Utilities.base64Decode(joined), mime, name);
     const gf = folder.createFile(blob);
     fileLinks.push(gf.getUrl());
-  });
+  }
+
+  payTrashUploadTempFiles_(folder);
 
   const sh = payEnsureQueueSheet_();
   const newRow = sh.getLastRow() + 1;
-  const createdBy = Session.getActiveUser().getEmail() || '';
   sh.getRange(newRow, 1, 1, 19).setValues([[
-    queueId, new Date(), createdBy, managerSheetName, managerName, spec, pType,
-    pct, counterparty, amount, 'CNY', payload.dueDate ? new Date(payload.dueDate) : '',
-    JSON.stringify(matchedRows), folder.getUrl(), JSON.stringify(fileLinks), 'На проверке', '', '', ''
+    meta.queueId,
+    new Date(),
+    meta.createdBy,
+    meta.managerSheetName,
+    meta.managerName,
+    meta.spec,
+    meta.paymentType,
+    meta.percent,
+    meta.counterparty,
+    meta.amount,
+    meta.currency,
+    meta.dueDate ? new Date(meta.dueDate) : '',
+    JSON.stringify(meta.matchedRows),
+    folder.getUrl(),
+    JSON.stringify(fileLinks),
+    'На проверке',
+    '',
+    '',
+    ''
   ]]);
 
-  paySaveCounterparty_(counterparty);
-  ui.alert('Заявка отправлена на проверку: ' + queueId);
-  return 'Заявка создана: ' + queueId;
+  paySaveCounterparty_(meta.counterparty);
+  return 'Заявка создана: ' + meta.queueId;
+}
+
+function payAssertUploadMeta_(folder, uploadToken) {
+  const meta = payReadUploadMeta_(folder);
+  if (!meta || payNorm_(meta.queueId) !== payNorm_(uploadToken)) {
+    throw new Error('Неверный токен загрузки или папка.');
+  }
+}
+
+function payReadUploadMeta_(folder) {
+  const it = folder.getFilesByName('__pay_upload_meta.json');
+  if (!it.hasNext()) return null;
+  const txt = it.next().getBlob().getDataAsString();
+  try {
+    return JSON.parse(txt);
+  } catch (e) {
+    return null;
+  }
+}
+
+function payTrashUploadTempFiles_(folder) {
+  const files = folder.getFiles();
+  while (files.hasNext()) {
+    const f = files.next();
+    const n = f.getName();
+    if (
+      n === '__pay_upload_meta.json' ||
+      /^__fileinfo_f\d+\.json$/i.test(n) ||
+      /^__part_f\d+_c\d+\.b64$/i.test(n)
+    ) {
+      f.setTrashed(true);
+    }
+  }
+}
+
+/**
+ * Совместимость: одна заявка одним вызовом (малые файлы). Крупные — через prepare / chunks / finalize.
+ */
+function paySubmitManagerRequest(payload, files) {
+  if (!files || !files.length) throw new Error('Нужно приложить подписанный документ.');
+  const prep = payPrepareManagerRequest_(payload);
+  const CHUNK = 450000;
+  for (let i = 0; i < files.length; i++) {
+    const f = files[i];
+    const data = f.data || '';
+    const total = Math.max(1, Math.ceil(data.length / CHUNK));
+    for (let c = 0; c < total; c++) {
+      payUploadManagerFileChunk_(
+        prep.uploadToken,
+        prep.folderId,
+        i,
+        c,
+        total,
+        f.name || 'file',
+        f.type || 'application/octet-stream',
+        data.substring(c * CHUNK, (c + 1) * CHUNK)
+      );
+    }
+  }
+  return payFinalizeManagerRequest_(prep.uploadToken, prep.folderId);
 }
 
 function payOpenApprovalDialog() {
@@ -267,11 +521,19 @@ function payGetPendingQueue_() {
   if (last < 2) return [];
   const data = sh.getRange(2, 1, last - 1, 19).getValues();
   const out = [];
+  const seenById = {};
+  const seenBySig = {};
   data.forEach(function (r, i) {
     if (payNorm_(r[15]) !== 'На проверке') return;
+    const qid = payNorm_(r[0]);
+    const sig = payQueueSignatureFromRow_(r);
+    if (qid && seenById[qid]) return;
+    if (sig && seenBySig[sig]) return;
+    if (qid) seenById[qid] = true;
+    if (sig) seenBySig[sig] = true;
     out.push({
       row: i + 2,
-      queueId: r[0],
+      queueId: qid || ('ROW-' + (i + 2)),
       manager: r[4],
       spec: r[5],
       paymentType: r[6],
@@ -302,7 +564,7 @@ function payApprovalDialogHtml_(list) {
       }
       return '<tr><td>' + x.queueId + '</td><td>' + x.manager + '</td><td>' + x.spec + '</td><td>' + x.paymentType + '</td><td>' + x.percent + '</td><td>' + x.amount + '</td><td>' + x.counterparty + '</td><td>' + x.dueDate + '</td><td>' + (docs.join('<br>') || '-') + '</td><td><button onclick="ap(' + x.row + ')">Одобрить</button> <button onclick="rej(' + x.row + ')">Отклонить</button></td></tr>';
     }).join('') +
-    '</table><script>function ap(row){google.script.run.withSuccessHandler(function(m){alert(m);google.script.host.close();}).withFailureHandler(function(e){alert(e.message||e);}).payApproveQueueRow(row);}function rej(row){var reason=prompt("Причина отклонения:","");if(reason===null)return;if(!String(reason).trim()){alert("Укажите причину");return;}google.script.run.withSuccessHandler(function(m){alert(m);google.script.host.close();}).withFailureHandler(function(e){alert(e.message||e);}).payRejectQueueRow(row, reason);}</script></body></html>'
+    '</table><script>var busy=false;function lockUi(){if(busy)return false;busy=true;var bs=document.querySelectorAll(\"button\");for(var i=0;i<bs.length;i++)bs[i].disabled=true;return true;}function unlockUi(){busy=false;var bs=document.querySelectorAll(\"button\");for(var i=0;i<bs.length;i++)bs[i].disabled=false;}function ap(row){if(!lockUi())return;google.script.run.withSuccessHandler(function(m){alert(m);google.script.host.close();}).withFailureHandler(function(e){unlockUi();alert(e.message||e);}).payApproveQueueRow(row);}function rej(row){if(!lockUi())return;var reason=prompt(\"Причина отклонения:\",\"\");if(reason===null){unlockUi();return;}if(!String(reason).trim()){unlockUi();alert(\"Укажите причину\");return;}google.script.run.withSuccessHandler(function(m){alert(m);google.script.host.close();}).withFailureHandler(function(e){unlockUi();alert(e.message||e);}).payRejectQueueRow(row, reason);}</script></body></html>'
   );
 }
 
@@ -316,10 +578,18 @@ function payGetDraftRootFolder_() {
 }
 
 function payApproveQueueRow(queueRow) {
+  const lock = LockService.getDocumentLock();
+  lock.waitLock(30000);
+  try {
   payAssertApprover_();
   const sh = payEnsureQueueSheet_();
   const r = sh.getRange(queueRow, 1, 1, 19).getValues()[0];
-  if (payNorm_(r[15]) !== 'На проверке') throw new Error('Строка уже обработана.');
+  const status = payNorm_(r[15]);
+  if (status !== 'На проверке') {
+    const existingReq = payNorm_(r[16]);
+    if (existingReq) return 'Заявка уже обработана ранее: ' + existingReq;
+    throw new Error('Строка уже обработана.');
+  }
 
   const queueId = r[0];
   const createdBy = r[2];
@@ -330,6 +600,7 @@ function payApproveQueueRow(queueRow) {
   const percent = r[7];
   const counterparty = r[8];
   const amount = r[9];
+  const currency = payNorm_(r[10]) || 'CNY';
   const dueDate = r[11];
   const managerRows = JSON.parse(r[12] || '[]');
   const draftFolderUrl = payNorm_(r[13]);
@@ -355,13 +626,18 @@ function payApproveQueueRow(queueRow) {
   regSh.getRange(newRow, 5).setValue(counterparty);
   regSh.getRange(newRow, 6).setValue(purpose);
   regSh.getRange(newRow, 7).setValue(amount);
-  regSh.getRange(newRow, 8).setValue('CNY');
+  regSh.getRange(newRow, 8).setValue(currency);
   regSh.getRange(newRow, 9).setValue(fileLinks.join('\n'));
   regSh.getRange(newRow, 10).setValue('На согласовании');
   regSh.getRange(newRow, 11).setValue('');
   regSh.getRange(newRow, 12).setValue('');
   regSh.getRange(newRow, 13).setValue('Передано из менеджерской заявки ' + queueId);
   regSh.getRange(newRow, 14).setValue('Не оплачено');
+  if (currency.toUpperCase() === 'RUB') {
+    regSh.getRange(newRow, 16).setValue(amount);
+  } else {
+    regSh.getRange(newRow, 16).setFormula('=G' + newRow + '*GOOGLEFINANCE("CURRENCY:' + currency.toUpperCase() + 'RUB")');
+  }
   regSh.getRange(newRow, 17).setValue(approver);
   regSh.getRange(newRow, 18).setValue(reqNo);
   regSh.getRange(newRow, 19).setValue(finalFolderUrl);
@@ -373,7 +649,26 @@ function payApproveQueueRow(queueRow) {
 
   sh.getRange(queueRow, 14).setValue(finalFolderUrl);
   payWriteRequestToManagerAndSummary_(managerSheet, managerName, spec, managerRows, reqNo, finalFolderUrl);
+
+  // Авто-пометка дублей этой же заявки в очереди, чтобы они не висели "На проверке".
+  const allLast = sh.getLastRow();
+  if (allLast >= 2) {
+    const all = sh.getRange(2, 1, allLast - 1, 19).getValues();
+    const currentSig = payQueueSignatureFromRow_(r);
+    for (let i = 0; i < all.length; i++) {
+      const absRow = i + 2;
+      if (absRow === queueRow) continue;
+      if (payNorm_(all[i][15]) !== 'На проверке') continue;
+      if (payQueueSignatureFromRow_(all[i]) !== currentSig) continue;
+      sh.getRange(absRow, 16).setValue('Отклонено');
+      sh.getRange(absRow, 19).setValue('Авто: дубликат заявки, одобрена ' + reqNo);
+    }
+  }
+
   return 'Заявка отправлена в реестр: ' + reqNo;
+  } finally {
+    lock.releaseLock();
+  }
 }
 
 function payRejectQueueRow(queueRow, reason) {
