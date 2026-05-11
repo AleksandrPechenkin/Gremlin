@@ -34,6 +34,28 @@ const MS_ATTR = {
 
 const cache = { suppliers: {}, products: {}, currencyYuanMeta: null };
 
+/** Совпадает с supplier_invoices: шапка в строке 2, данные с 3. */
+const MANAGER_SUMMARY_SYNC_HEADER_ROW = 2;
+const MANAGER_SUMMARY_SYNC_DATA_START_ROW = 3;
+/** Фон строки-разделителя между блоками календарных месяцев (из имени вкладки Имя ММ/ГГ). */
+const MANAGER_SUMMARY_MONTH_SEP_BG = '#D9E1F2';
+
+/**
+ * Флаг показа меню Sync Hub в книге 01.
+ * - unset / 1 / true / yes / on: меню показываем
+ * - 0 / false / no / off: меню скрываем (используется после переноса хаба в 04)
+ */
+function isSyncHubMenuEnabled_() {
+  try {
+    const raw = PropertiesService.getScriptProperties().getProperty('SYNC_HUB_MENU_ENABLED');
+    if (raw == null || String(raw).trim() === '') return true;
+    const v = String(raw).trim().toLowerCase();
+    return !(v === '0' || v === 'false' || v === 'no' || v === 'off');
+  } catch (e) {
+    return true;
+  }
+}
+
 function onOpen() {
   const ui = SpreadsheetApp.getUi();
   ui.createMenu('📦 МойСклад')
@@ -51,7 +73,7 @@ function onOpen() {
   if (typeof addSenderStockMenu_ === 'function') {
     addSenderStockMenu_(ui);
   }
-  if (typeof addSyncHubMenu_ === 'function') {
+  if (typeof addSyncHubMenu_ === 'function' && isSyncHubMenuEnabled_()) {
     addSyncHubMenu_(ui);
   }
   ui.createMenu('Планирование закупок')
@@ -220,6 +242,363 @@ function syncOrdersWithMS() {
   
   updater.flush();
   SpreadsheetApp.getUi().alert(`Синхронизация завершена!\n\n🆕 Создано: ${createdOrders}\n🔄 Обновлено: ${updatedOrders}\n🗑️ Удалено/Очищено брошенных: ${deletedOrders}\n❌ Ошибок: ${errorCount}`);
+}
+
+/**
+ * Заполнение листа «Сводная» только с вкладок вида «Имя ММ/ГГ» или «Имя ММ/ГГГГ»
+ * (например «Нина 07/26» — менеджер Нина, заказы на июль 2026).
+ * Месяц для сортировки и разделителей берётся из имени вкладки; в колонку «Менеджер» пишется имя без даты.
+ */
+function syncManagerTabsToSummary() {
+  const ui = SpreadsheetApp.getUi();
+  const ss = SpreadsheetApp.getActiveSpreadsheet();
+  const summarySh = ss.getSheetByName(SHEET_NAME);
+  if (!summarySh) {
+    ui.alert('Не найден лист «' + SHEET_NAME + '».');
+    return;
+  }
+  const ex = syncManagerSummaryExcludeSet_();
+  const sheets = ss.getSheets();
+  /** @type {{ sheet: GoogleAppsScript.Spreadsheet.Sheet, meta: Object }[]} */
+  const sources = [];
+  let i;
+  let sh;
+  for (i = 0; i < sheets.length; i++) {
+    sh = sheets[i];
+    const nameTrim = safeString(sh.getName()).trim();
+    if (nameTrim === safeString(SHEET_NAME).trim()) continue;
+    if (syncManagerSheetIsExcluded_(nameTrim, ex)) continue;
+    const tabMeta = syncManagerSummaryParseManagerMonthTab_(nameTrim);
+    if (!tabMeta) continue;
+    if (sh.getLastRow() < MANAGER_SUMMARY_SYNC_DATA_START_ROW) continue;
+    sources.push({ sheet: sh, meta: tabMeta });
+  }
+
+  sources.sort(function (a, b) {
+    return a.sheet.getIndex() - b.sheet.getIndex();
+  });
+
+  if (!sources.length) {
+    ui.alert(
+      'Нет вкладок для сборки в формате «Имя ММ/ГГ» или «Имя ММ/ГГГГ», например «Нина 07/26» или «Никита 08/2026».\n' +
+        'Нужна строка с данными начиная с ' +
+        MANAGER_SUMMARY_SYNC_DATA_START_ROW +
+        '. Исключены «Сводная», справочники и системные листы из списка исключений.'
+    );
+    return;
+  }
+
+  let maxCol = Math.max(summarySh.getLastColumn(), COL.STATUS + 1);
+  let widest = sources[0].sheet;
+  for (i = 0; i < sources.length; i++) {
+    const sht = sources[i].sheet;
+    maxCol = Math.max(maxCol, sht.getLastColumn());
+    if (sht.getLastColumn() > widest.getLastColumn()) {
+      widest = sht;
+    }
+  }
+
+  const headerSheet = widest;
+  const headerRaw =
+    headerSheet
+      .getRange(
+        MANAGER_SUMMARY_SYNC_HEADER_ROW,
+        1,
+        MANAGER_SUMMARY_SYNC_HEADER_ROW,
+        headerSheet.getLastColumn()
+      )
+      .getValues()[0] || [];
+  const header = syncManagerSummaryPad_(headerRaw, maxCol);
+
+  const row1Existing =
+    summarySh.getLastRow() >= 1
+      ? summarySh.getRange(1, 1, 1, Math.max(summarySh.getLastColumn(), 1)).getValues()[0]
+      : [];
+  const row1 = syncManagerSummaryPad_(row1Existing, maxCol);
+
+  /** @type {{ row: Object[], monthKey: string, labelRus: string, sourceIndex: number, rowIdx: number }[]} */
+  const collected = [];
+  let sIdx;
+  for (sIdx = 0; sIdx < sources.length; sIdx++) {
+    const src = sources[sIdx].sheet;
+    const tabMeta = sources[sIdx].meta;
+    const srcIndex = src.getIndex();
+    const lc = Math.max(src.getLastColumn(), 1);
+    const lr = src.getLastRow();
+    const block =
+      lr >= MANAGER_SUMMARY_SYNC_DATA_START_ROW
+        ? src.getRange(MANAGER_SUMMARY_SYNC_DATA_START_ROW, 1, lr, lc).getValues()
+        : [];
+
+    let rIdx;
+    for (rIdx = 0; rIdx < block.length; rIdx++) {
+      const rowSrc = block[rIdx];
+      if (syncManagerSummaryRowIgnorable_(rowSrc)) continue;
+      const row = syncManagerSummaryPad_(rowSrc, maxCol);
+      row[COL.MANAGER] = tabMeta.manager;
+      collected.push({
+        row: row,
+        monthKey: tabMeta.monthKey,
+        labelRus: tabMeta.labelRus,
+        sourceIndex: srcIndex,
+        rowIdx: rIdx
+      });
+    }
+  }
+
+  collected.sort(function (a, b) {
+    if (a.monthKey !== b.monthKey) {
+      return a.monthKey < b.monthKey ? -1 : 1;
+    }
+    if (a.sourceIndex !== b.sourceIndex) {
+      return a.sourceIndex - b.sourceIndex;
+    }
+    return a.rowIdx - b.rowIdx;
+  });
+
+  const out = [row1, header];
+  const sepMask = [];
+  sepMask.push(false);
+  sepMask.push(false);
+
+  let dataLines = collected.length;
+  let sepLines = 0;
+  let prevMonthKey = null;
+  let cIdx;
+  for (cIdx = 0; cIdx < collected.length; cIdx++) {
+    const entry = collected[cIdx];
+    const rowPad = entry.row;
+    const monthKey = entry.monthKey;
+
+    if (prevMonthKey !== null && monthKey !== prevMonthKey) {
+      out.push(
+        syncManagerSummarySeparatorRow_(maxCol, {
+          hasDate: true,
+          labelRus: entry.labelRus
+        })
+      );
+      sepMask.push(true);
+      sepLines++;
+    }
+
+    out.push(rowPad);
+    sepMask.push(false);
+    prevMonthKey = monthKey;
+  }
+
+  summarySh.clearContents();
+  summarySh.getRange(1, 1, out.length, maxCol).setValues(out);
+
+  syncManagerSummaryApplyColumnFormats_(summarySh, out.length);
+  syncManagerSummaryApplySeparatorStyles_(summarySh, sepMask, maxCol);
+
+  ui.alert(
+    'Сводная обновлена.\nВкладок «Имя ММ/ГГ»: ' +
+      sources.length +
+      '\nСтрок данных: ' +
+      dataLines +
+      '\nРазделителей между месяцами: ' +
+      sepLines +
+      '\nКолонок: ' +
+      maxCol +
+      '.'
+  );
+}
+
+function syncManagerSummaryApplyColumnFormats_(summarySh, totalRows) {
+  const dataStart = MANAGER_SUMMARY_SYNC_DATA_START_ROW;
+  const rows = Math.max(0, totalRows - dataStart + 1);
+  if (!rows) return;
+
+  // «Объем» и «Вес» должны быть числами; иначе при старых форматах листа отображаются как дата.
+  const volumeCol1 = COL.VOLUME + 1;
+  const weightCol1 = COL.WEIGHT + 1;
+  try {
+    summarySh.getRange(dataStart, volumeCol1, rows, 1).setNumberFormat('0.000');
+  } catch (e) {}
+  try {
+    summarySh.getRange(dataStart, weightCol1, rows, 1).setNumberFormat('0.000');
+  } catch (e) {}
+}
+
+/**
+ * Имя вкладки менеджерского месяца: текст, пробелы, ММ/ГГ или ММ/ГГГГ в конце.
+ * @returns {{ manager: string, monthKey: string, labelRus: string, normalizedName: string }|null}
+ */
+function syncManagerSummaryParseManagerMonthTab_(sheetNameTrim) {
+  const normalizedName = sheetNameTrim.replace(/\s+/g, ' ').trim();
+  const mm = normalizedName.match(/^(.+?)\s+(\d{1,2})\/(\d{2,4})$/);
+  if (!mm) return null;
+
+  let managerName = syncManagerNormalizeManagerToken_(safeString(mm[1]));
+  const monthNum = parseInt(mm[2], 10);
+  let yearNum = parseInt(mm[3], 10);
+
+  if (!managerName || monthNum < 1 || monthNum > 12) return null;
+  if (yearNum < 100) yearNum += 2000;
+  if (yearNum < 1990 || yearNum > 2100) return null;
+
+  const mk = monthNum < 10 ? yearNum + '-0' + monthNum : yearNum + '-' + monthNum;
+  const MONTHS_RU = [
+    'январь',
+    'февраль',
+    'март',
+    'апрель',
+    'май',
+    'июнь',
+    'июль',
+    'август',
+    'сентябрь',
+    'октябрь',
+    'ноябрь',
+    'декабрь'
+  ];
+  const labelRus = MONTHS_RU[monthNum - 1] + ' ' + yearNum;
+
+  return {
+    manager: managerName,
+    monthKey: mk,
+    labelRus: labelRus,
+    normalizedName: normalizedName
+  };
+}
+
+function syncManagerNormalizeManagerToken_(displayName) {
+  return safeString(displayName).replace(/^[\s-_]+/, '').replace(/[\s-_]+$/, '').trim();
+}
+
+function syncManagerSummarySeparatorRow_(maxCol, nextRowMonthMeta) {
+  const row = [];
+  let k;
+  for (k = 0; k < maxCol; k++) {
+    row.push('');
+  }
+  if (nextRowMonthMeta.hasDate && safeString(nextRowMonthMeta.labelRus)) {
+    row[0] = '▸ ' + nextRowMonthMeta.labelRus;
+  } else {
+    row[0] = '▸ (месяц не распознан по вкладке)';
+  }
+  return row;
+}
+
+function syncManagerSummaryApplySeparatorStyles_(sh, sepMask, maxCol) {
+  let r;
+  let rowNum;
+  for (r = 0; r < sepMask.length; r++) {
+    if (!sepMask[r]) continue;
+    rowNum = r + 1;
+    const range = sh.getRange(rowNum, 1, rowNum, maxCol);
+    range
+      .setBackground(MANAGER_SUMMARY_MONTH_SEP_BG)
+      .setFontWeight('bold')
+      .setBorder(
+        false,
+        false,
+        true,
+        false,
+        false,
+        false,
+        '#9BB4D7',
+        SpreadsheetApp.BorderStyle.SOLID_MEDIUM
+      );
+  }
+}
+
+function syncManagerSummaryExcludeSet_() {
+  const exactRaw = ['Закуплено', 'SYNC_LOG', 'Stock_Movements', 'Транзитный склад', 'Планирование отгрузок'];
+  const exact = {};
+  let i;
+  for (i = 0; i < exactRaw.length; i++) {
+    exact[exactRaw[i]] = true;
+  }
+  exact[safeString(SHEET_NAME).trim()] = true;
+  const prefixes = ['Справочник', 'Проставление планов', 'Склады МС'];
+  return { exact: exact, prefixes: prefixes };
+}
+
+function syncManagerSheetIsExcluded_(nameTrim, ex) {
+  if (ex.exact[nameTrim]) return true;
+  let p;
+  for (p = 0; p < ex.prefixes.length; p++) {
+    if (nameTrim.indexOf(ex.prefixes[p]) === 0) return true;
+  }
+  return false;
+}
+
+function syncManagerSummaryPad_(row, len) {
+  const out = [];
+  let k;
+  for (k = 0; k < len; k++) {
+    out.push(k < row.length ? row[k] : '');
+  }
+  return out;
+}
+
+/** Пропуск только полностью пустых строк и «хвостов» без полей заказа. */
+function syncManagerSummaryRowIgnorable_(row) {
+  if (!row || !row.length) return true;
+
+  // Явные ключи заказа
+  if (
+    !syncManagerBlankish_(row[COL.WB_ARTICLE]) ||
+    !syncManagerBlankish_(row[COL.SUPPLIER_ARTICLE]) ||
+    !syncManagerBlankish_(row[COL.BARCODE]) ||
+    !syncManagerBlankish_(row[COL.SPEC_NUMBER])
+  ) {
+    return false;
+  }
+
+  // Статусы/типы/даты — тоже считаем «данными»
+  if (
+    !syncManagerBlankish_(row[COL.SUPPLIER_MS]) ||
+    !syncManagerBlankish_(row[COL.ORDER_STATUS]) ||
+    !syncManagerBlankish_(row[COL.DELIVERY_TYPE]) ||
+    !syncManagerBlankish_(row[COL.READY_DATE])
+  ) {
+    return false;
+  }
+
+  // Числа: считаем пустым, если null/пусто/0.
+  if (
+    !syncManagerZeroish_(row[COL.TOTAL_QTY]) ||
+    !syncManagerZeroish_(row[COL.QTY]) ||
+    !syncManagerZeroish_(row[COL.PRICE]) ||
+    !syncManagerZeroish_(row[COL.AMOUNT]) ||
+    !syncManagerZeroish_(row[COL.VOLUME]) ||
+    !syncManagerZeroish_(row[COL.WEIGHT])
+  ) {
+    return false;
+  }
+
+  // Финальный фолбэк: если где-то есть «осмысленное» значение (кроме колонки менеджера) — оставляем.
+  let j;
+  for (j = 0; j < row.length; j++) {
+    if (j === COL.MANAGER) continue; // на вкладках часто проставляют менеджера формулой — не считаем это признаком данных
+    if (!syncManagerBlankish_(row[j])) return false;
+  }
+  return true;
+}
+
+function syncManagerBlankish_(v) {
+  if (v == null) return true;
+  if (typeof v === 'number') return !isFinite(v) || v === 0;
+  const s = String(v).trim();
+  if (!s) return true;
+  const t = s.replace(/\u00A0/g, ' ').trim().toLowerCase();
+  return (
+    t === '-' ||
+    t === '—' ||
+    t === '–' ||
+    t === 'нет' ||
+    t === 'n/a' ||
+    t === 'na' ||
+    t === '0'
+  );
+}
+
+function syncManagerZeroish_(v) {
+  const n = parseNumber(v);
+  return n == null || n === 0;
 }
 
 function findExistingOrderInMS(supplierId, specNum) {

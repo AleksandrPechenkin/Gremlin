@@ -20,6 +20,7 @@
 Опциональные Script Properties:
 - ORDERS_SPREADSHEET_ID — ID книги 01 (заказы); для хаба в 04 обязательно; в книге 01 можно не задавать, если совпадает с текущим файлом
 - MASTER_REF_SPREADSHEET_ID, TRANSIT_SPREADSHEET_ID, PROCUREMENT_SPREADSHEET_ID, COST_SPREADSHEET_ID — см. sync_hub.gs (синхронизация между книгами)
+- SYNC_HUB_MENU_ENABLED — показ меню «Синхронизация книг» в книге 01 (по умолчанию включено; поставьте 0/false/no/off, чтобы скрыть меню после переноса хаба в 04)
 - MS_STORE_ID
 - EXTERNAL_SHEET_NAME (по умолчанию: Закуплено)
 - SALES_PLANS_SPREADSHEET_ID (книга с «Проставление планов …»; в коде есть ID по умолчанию)

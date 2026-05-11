@@ -1,4 +1,4 @@
-/**
+﻿/**
  * Sync Hub: обмен между книгами 01–05. Журнал по умолчанию пишется в книгу 04 (MASTER_REF_SPREADSHEET_ID).
  *
  * Реестр книг (Script Properties проекта, куда вставлен sync_hub.gs):
@@ -7,11 +7,15 @@
  *   TRANSIT_SPREADSHEET_ID   — книга 02
  *   PROCUREMENT_SPREADSHEET_ID — книга 03
  *   COST_SPREADSHEET_ID      — книга 05
+ *
+ * Операционные снимки (Script Property, опционально):
+ *   ORDERS_SUMMARY_SHEET_NAME — лист заказной сводки в 01 для копирования в 02/03 (по умолчанию: Сводная)
  */
 const SYNC_HUB_CFG = {
   PROPS: {
     MASTER_REF_SPREADSHEET_ID: 'MASTER_REF_SPREADSHEET_ID',
     ORDERS_SPREADSHEET_ID: 'ORDERS_SPREADSHEET_ID',
+    ORDERS_SUMMARY_SHEET_NAME: 'ORDERS_SUMMARY_SHEET_NAME',
     TRANSIT_SPREADSHEET_ID: 'TRANSIT_SPREADSHEET_ID',
     PROCUREMENT_SPREADSHEET_ID: 'PROCUREMENT_SPREADSHEET_ID',
     COST_SPREADSHEET_ID: 'COST_SPREADSHEET_ID',
@@ -35,6 +39,7 @@ const SYNC_HUB_CFG = {
     SYNC_BATCH_SIZE: 800,
     SYNC_LOCK_TIMEOUT_MS: 30000,
     SYNC_LOG_SHEET_NAME: 'SYNC_LOG',
+    ORDERS_SUMMARY_SHEET_NAME: 'Сводная',
     MASTER_PRODUCTS_SHEET_NAME: 'Справочник товары',
     MASTER_SUPPLIERS_SHEET_NAME: 'Справочник поставщики и условия',
     TRANSIT_SNAPSHOT_SHEET_NAME: 'Транзитный склад',
@@ -57,8 +62,71 @@ function addSyncHubMenu_(ui) {
     .addItem('Показать листы книги 04 (диагностика)', 'syncHubShowMasterSheets_')
     .addSeparator()
     .addItem('Синхронизировать справочники (из 04)', 'syncMasterRefsFrom04_')
-    .addItem('Пробный прогон (dry-run)', 'syncAllExternalBooksDryRun_')
+    .addItem('Собрать справочники в 04 (из 05)', 'syncCollectRefsTo04From05_')
+    .addItem('Восстановить полный «Справочник товары» в 04 (из внешней книги)', 'syncRestoreFullProductsTo04WithConfirm_')
+    .addSeparator()
+    .addItem('Пробный прогон (dry-run все потоки)', 'syncAllExternalBooksDryRun_')
+    .addItem('Полная синхронизация (все потоки)', 'syncAllExternalBooksWithConfirm_')
+    .addSubMenu(
+      ui
+        .createMenu('Операционные потоки')
+        .addItem('Dry-run: Сводная 01→02 и 03', 'syncOperationalSnapshotsDryRun_')
+        .addItem('Сводная 01→02 и 03 (боевой)', 'syncOperationalSnapshotsWithConfirm_')
+    )
     .addToUi();
+}
+
+/**
+ * Восстановление мастер-справочника товаров в книге 04 из внешней книги.
+ * Источник сейчас фиксированный (по вашему сообщению):
+ * - Spreadsheet ID: 1PXWd05ENcZGvPYYbAVvf-1EPevdwkxr4IvjRbbojOlg
+ * - Sheet: «Справочник с названием товаров»
+ */
+function syncRestoreFullProductsTo04WithConfirm_() {
+  const ui = SpreadsheetApp.getUi();
+  const r = ui.alert(
+    'Восстановление справочника товаров',
+    'Перезаписать лист «Справочник товары» в книге 04 данными из внешней книги?\n\n' +
+      'Источник: 1PXWd05ENcZGvPYYbAVvf-1EPevdwkxr4IvjRbbojOlg\n' +
+      'Лист: «Справочник с названием товаров»\n\n' +
+      'Операция полностью очистит целевой лист и запишет значения.',
+    ui.ButtonSet.YES_NO
+  );
+  if (r !== ui.Button.YES) return;
+  const msg = syncRestoreFullProductsTo04_(false);
+  ui.alert('✅ Готово', msg, ui.ButtonSet.OK);
+}
+
+function syncRestoreFullProductsTo04DryRun_() {
+  return syncRestoreFullProductsTo04_(true);
+}
+
+function syncRestoreFullProductsTo04_(dryRun) {
+  const SOURCE_SPREADSHEET_ID = '1PXWd05ENcZGvPYYbAVvf-1EPevdwkxr4IvjRbbojOlg';
+  const SOURCE_SHEET_NAME = 'Справочник с названием товаров';
+  try {
+    const sourceSs = SpreadsheetApp.openById(SOURCE_SPREADSHEET_ID);
+    const targetSs = syncHubOpenSpreadsheetForBook_('04');
+    const mappings = [
+      {
+        source: SOURCE_SHEET_NAME,
+        sourceAliases: [SOURCE_SHEET_NAME],
+        target: syncHubGetProp_(SYNC_HUB_CFG.PROPS.MASTER_PRODUCTS_SHEET_NAME, SYNC_HUB_CFG.DEFAULTS.MASTER_PRODUCTS_SHEET_NAME),
+        targetAliases: [SYNC_HUB_CFG.DEFAULTS.MASTER_PRODUCTS_SHEET_NAME],
+        required: true
+      }
+    ];
+    const stats = syncHubCopyMappings_(sourceSs, targetSs, mappings, {
+      dryRun: !!dryRun,
+      createMissingTarget: true
+    });
+    const msg = 'Восстановление товаров в 04: ' + stats;
+    syncHubLog_('RESTORE 04 Товары', 'OK', msg, !!dryRun);
+    return msg;
+  } catch (e) {
+    syncHubLog_('RESTORE 04 Товары', 'ERROR', e.message || String(e), !!dryRun);
+    throw e;
+  }
 }
 
 function syncHubHealthCheck() {
@@ -178,6 +246,27 @@ function syncAllExternalBooksDryRun_() {
   return syncAllExternalBooksImpl_(true);
 }
 
+/**
+ * Боевой прогон: 04→01 справочники, 04→01/02/05 статусы, 05→04 справочники.
+ * С подтверждением, чтобы не случайно перезаписать листы.
+ */
+function syncAllExternalBooksWithConfirm_() {
+  const ui = SpreadsheetApp.getUi();
+  const r = ui.alert(
+    'Полная синхронизация',
+    'Запустить боевой прогон всех потоков?\n\n' +
+      '• 04→01: товары и поставщики\n' +
+      '• 04→01, 02, 05: справочник статусов (при необходимости создаются листы)\n' +
+      '• 05→04: урезанный каталог из рейсов, таможсбор, типы событий\n\n' +
+      'Журнал: лист SYNC_LOG в книге 04.',
+    ui.ButtonSet.YES_NO
+  );
+  if (r !== ui.Button.YES) {
+    return;
+  }
+  syncAllExternalBooks_();
+}
+
 function syncAllExternalBooksImpl_(dryRun) {
   const lock = LockService.getScriptLock();
   const lockTimeoutMs = syncHubGetNumberProp_(
@@ -187,7 +276,9 @@ function syncAllExternalBooksImpl_(dryRun) {
   lock.waitLock(Math.max(1000, lockTimeoutMs));
   try {
     const report = [];
-    report.push(syncMasterRefsFrom04_(dryRun));
+    report.push(syncMasterRefsFrom04_(dryRun, { silent: true }));
+    report.push(syncStatusRefFrom04ToBooks_(dryRun));
+    report.push(syncCollectRefsTo04From05_(dryRun));
     SpreadsheetApp.getUi().alert(
       dryRun ? '🧪 Dry-run завершен' : '✅ Синхронизация завершена',
       report.join('\n'),
@@ -199,7 +290,156 @@ function syncAllExternalBooksImpl_(dryRun) {
   }
 }
 
-function syncMasterRefsFrom04_(dryRun) {
+function syncOperationalSnapshotsDryRun_() {
+  syncOperationalSnapshotsImpl_(true);
+}
+
+/**
+ * Снимок «Сводная» (или ORDERS_SUMMARY_SHEET_NAME) из 01 в 02 и при заданной 03 — в 03.
+ * Нужен для sender_stock (02) и блоков in-transit в procurement_planning (03).
+ */
+function syncOperationalSnapshotsWithConfirm_() {
+  const ui = SpreadsheetApp.getUi();
+  const r = ui.alert(
+    'Сводная 01→02 и 03',
+    'Скопировать лист заказной сводки из книги 01 в книги 02 и 03?\n\n' +
+      'Свойство ORDERS_SUMMARY_SHEET_NAME (по умолчанию «Сводная»).\n' +
+      'Если PROCUREMENT_SPREADSHEET_ID пуст — шаг 01→03 пропускается.\n\n' +
+      'Целевой лист в 02/03 будет полностью перезаписан значениями с 01.',
+    ui.ButtonSet.YES_NO
+  );
+  if (r !== ui.Button.YES) {
+    return;
+  }
+  syncOperationalSnapshotsImpl_(false);
+}
+
+function syncOperationalSnapshotsImpl_(dryRun) {
+  const lock = LockService.getScriptLock();
+  const lockTimeoutMs = syncHubGetNumberProp_(
+    SYNC_HUB_CFG.PROPS.SYNC_LOCK_TIMEOUT_MS,
+    SYNC_HUB_CFG.DEFAULTS.SYNC_LOCK_TIMEOUT_MS
+  );
+  lock.waitLock(Math.max(1000, lockTimeoutMs));
+  try {
+    const report = [];
+    report.push(syncOperationalOrdersSummaryFrom01To02_(dryRun, { silent: true }));
+    report.push(syncOperationalOrdersSummaryFrom01To03_(dryRun, { silent: true }));
+    SpreadsheetApp.getUi().alert(
+      dryRun ? '🧪 Dry-run операционные снимки' : '✅ Операционные снимки готовы',
+      report.join('\n'),
+      SpreadsheetApp.getUi().ButtonSet.OK
+    );
+    return report.join('\n');
+  } finally {
+    lock.releaseLock();
+  }
+}
+
+function syncOperationalOrdersSummaryFrom01To02_(dryRun, opt) {
+  const silent = !!(opt && opt.silent);
+  try {
+    const summaryName = syncHubGetProp_(
+      SYNC_HUB_CFG.PROPS.ORDERS_SUMMARY_SHEET_NAME,
+      SYNC_HUB_CFG.DEFAULTS.ORDERS_SUMMARY_SHEET_NAME
+    );
+    const sourceSs = syncHubOpenSpreadsheetForBook_('01');
+    const targetSs = syncHubOpenSpreadsheetForBook_('02');
+    const mappings = [
+      {
+        source: summaryName,
+        sourceAliases: ['Сводная'],
+        target: summaryName,
+        targetAliases: ['Сводная'],
+        required: true
+      }
+    ];
+    const stats = syncHubCopyMappings_(sourceSs, targetSs, mappings, {
+      dryRun: !!dryRun,
+      createMissingTarget: true
+    });
+    const msg = '01→02: ' + stats;
+    syncHubLog_('01→02 Сводная', 'OK', msg, !!dryRun);
+    if (!silent) {
+      SpreadsheetApp.getUi().alert(
+        dryRun ? '🧪 Dry-run Сводная 01→02' : '✅ Сводная 01→02',
+        msg,
+        SpreadsheetApp.getUi().ButtonSet.OK
+      );
+    }
+    return msg;
+  } catch (e) {
+    syncHubLog_('01→02 Сводная', 'ERROR', e.message || String(e), !!dryRun);
+    if (!silent) {
+      SpreadsheetApp.getUi().alert(
+        'Ошибка Сводная 01→02',
+        e.message || String(e),
+        SpreadsheetApp.getUi().ButtonSet.OK
+      );
+    }
+    throw e;
+  }
+}
+
+function syncOperationalOrdersSummaryFrom01To03_(dryRun, opt) {
+  const silent = !!(opt && opt.silent);
+  try {
+    const r3 = syncHubResolveSpreadsheetIdForBook_('03', {});
+    if (!r3.id) {
+      const msg = '01→03: PROCUREMENT_SPREADSHEET_ID не задан — пропущено';
+      syncHubLog_('01→03 Сводная', 'OK', msg, !!dryRun);
+      return msg;
+    }
+    const summaryName = syncHubGetProp_(
+      SYNC_HUB_CFG.PROPS.ORDERS_SUMMARY_SHEET_NAME,
+      SYNC_HUB_CFG.DEFAULTS.ORDERS_SUMMARY_SHEET_NAME
+    );
+    const sourceSs = syncHubOpenSpreadsheetForBook_('01');
+    const targetSs = SpreadsheetApp.openById(r3.id);
+    const mappings = [
+      {
+        source: summaryName,
+        sourceAliases: ['Сводная'],
+        target: summaryName,
+        targetAliases: ['Сводная'],
+        required: true
+      }
+    ];
+    const stats = syncHubCopyMappings_(sourceSs, targetSs, mappings, {
+      dryRun: !!dryRun,
+      createMissingTarget: true
+    });
+    const msg = '01→03: ' + stats;
+    syncHubLog_('01→03 Сводная', 'OK', msg, !!dryRun);
+    if (!silent) {
+      SpreadsheetApp.getUi().alert(
+        dryRun ? '🧪 Dry-run Сводная 01→03' : '✅ Сводная 01→03',
+        msg,
+        SpreadsheetApp.getUi().ButtonSet.OK
+      );
+    }
+    return msg;
+  } catch (e) {
+    syncHubLog_('01→03 Сводная', 'ERROR', e.message || String(e), !!dryRun);
+    if (!silent) {
+      SpreadsheetApp.getUi().alert(
+        'Ошибка Сводная 01→03',
+        e.message || String(e),
+        SpreadsheetApp.getUi().ButtonSet.OK
+      );
+    }
+    throw e;
+  }
+}
+
+/**
+ * Справочники из книги 04 → книга 01 (ORDERS_SPREADSHEET_ID).
+ * Не использует активную книгу: иначе при запуске из 04 копирование шло бы в 04 и не попадало в 01.
+ * @param {boolean} dryRun
+ * @param {{ silent?: boolean }} opt если silent — без отдельного Ui.alert (для пакетного dry-run/синка)
+ */
+function syncMasterRefsFrom04_(dryRun, opt) {
+  const silent = !!(opt && opt.silent);
   try {
     const sourceId = syncHubGetRequiredProp_(SYNC_HUB_CFG.PROPS.MASTER_REF_SPREADSHEET_ID);
     const suppliersSourceSheet = syncHubGetProp_(
@@ -217,38 +457,154 @@ function syncMasterRefsFrom04_(dryRun) {
           'Справочник поставщики и условия',
           'Справочник поставщики и условия работы'
         ],
-        target: 'Справочник поставщики и условия'
+        target: 'Справочник поставщики и условия',
+        targetAliases: [
+          'Справочник поставщики и условия',
+          'Справочник поставщики и условия работы'
+        ]
       }
     ];
     const sourceSs = SpreadsheetApp.openById(sourceId);
-    const targetSs = SpreadsheetApp.getActiveSpreadsheet();
+    const targetSs = syncHubOpenSpreadsheetForBook_('01');
     const stats = syncHubCopyMappings_(sourceSs, targetSs, mappings, { dryRun: !!dryRun });
-    const msg = 'Справочники: ' + stats;
+    const msg = 'Справочники (04→01): ' + stats;
     syncHubLog_('04→01 Справочники', 'OK', msg, !!dryRun);
+    if (!silent) {
+      SpreadsheetApp.getUi().alert(
+        dryRun ? '🧪 Dry-run справочники из 04 в 01' : '✅ Справочники: 04 → 01',
+        msg,
+        SpreadsheetApp.getUi().ButtonSet.OK
+      );
+    }
     return msg;
   } catch (e) {
     syncHubLog_('04→01 Справочники', 'ERROR', e.message || String(e), !!dryRun);
+    if (!silent) {
+      SpreadsheetApp.getUi().alert('Ошибка 04→01 справочники', e.message || String(e), SpreadsheetApp.getUi().ButtonSet.OK);
+    }
+    throw e;
+  }
+}
+
+/**
+ * Раздача справочника статусов из 04 в книги 01/02/05.
+ * Книга 03 исключена (по бизнес-правилу статусы там не используются).
+ */
+function syncStatusRefFrom04ToBooks_(dryRun) {
+  const targets = [
+    { code: '01', title: '01' },
+    { code: '02', title: '02' },
+    { code: '05', title: '05' }
+  ];
+  const sourceSs = syncHubOpenSpreadsheetForBook_('04');
+  const lines = [];
+
+  for (let i = 0; i < targets.length; i++) {
+    const t = targets[i];
+    try {
+      const targetSs = syncHubOpenSpreadsheetForBook_(t.code);
+      const mappings = [
+        {
+          source: 'Справочник_статусов',
+          sourceAliases: ['Справочник статусов', 'Статусы'],
+          target: 'Справочник_статусов',
+          targetAliases: ['Справочник_статусов', 'Справочник статусов', 'Статусы'],
+          required: false
+        }
+      ];
+      const stats = syncHubCopyMappings_(sourceSs, targetSs, mappings, {
+        dryRun: !!dryRun,
+        createMissingTarget: true
+      });
+      lines.push(t.title + ': ' + stats);
+    } catch (e) {
+      lines.push(t.title + ': ERROR ' + (e.message || String(e)));
+    }
+  }
+
+  const msg = '04→(01,02,05) Статусы: ' + lines.join(' | ');
+  syncHubLog_('04→01/02/05 Статусы', 'OK', msg, !!dryRun);
+  return msg;
+}
+
+function syncCollectRefsTo04From05_(dryRun) {
+  try {
+    const sourceSs = syncHubOpenSpreadsheetForBook_('05');
+    const targetSs = syncHubOpenSpreadsheetForBook_('04');
+    const mappings = [
+      {
+        source: 'Справочник товаров (05)',
+        sourceAliases: ['Справочник товаров (05)', 'Справочник товары', 'Справочник_товары'],
+        // В 05 этот справочник урезанный (только позиции в рейсах), не перезаписываем мастер в 04.
+        target: 'Справочник товаров (05 урезанный)',
+        targetAliases: ['Справочник товаров (05 урезанный)']
+      },
+      {
+        source: 'Справочник поставщики и условия',
+        sourceAliases: ['Справочник поставщики и условия работы'],
+        target: 'Справочник поставщики и условия',
+        targetAliases: ['Справочник поставщики и условия', 'Справочник поставщики и условия работы'],
+        required: false
+      },
+      {
+        source: 'Справочник_таможсбор',
+        sourceAliases: ['Справочник таможсбор', 'Справочник таможенного сбора'],
+        target: 'Справочник_таможсбор',
+        targetAliases: ['Справочник_таможсбор', 'Справочник таможсбор', 'Справочник таможенного сбора'],
+        required: false
+      },
+      {
+        source: 'Типы_событий',
+        sourceAliases: ['Типы событий'],
+        target: 'Типы_событий',
+        targetAliases: ['Типы_событий', 'Типы событий'],
+        required: false
+      }
+    ];
+    const stats = syncHubCopyMappings_(sourceSs, targetSs, mappings, {
+      dryRun: !!dryRun,
+      createMissingTarget: true
+    });
+    const msg = '05→04 Справочники: ' + stats;
+    syncHubLog_('05→04 Справочники', 'OK', msg, !!dryRun);
+    return msg;
+  } catch (e) {
+    syncHubLog_('05→04 Справочники', 'ERROR', e.message || String(e), !!dryRun);
     throw e;
   }
 }
 
 function syncHubCopyMappings_(sourceSs, targetSs, mappings, options) {
   const dryRun = !!(options && options.dryRun);
+  const createMissingTarget = !!(options && options.createMissingTarget);
   const batchSize = Math.max(100, syncHubGetNumberProp_(SYNC_HUB_CFG.PROPS.SYNC_BATCH_SIZE, SYNC_HUB_CFG.DEFAULTS.SYNC_BATCH_SIZE));
   const parts = [];
 
   mappings.forEach(function (m) {
     const sourceSheet = syncHubFindSheetByNames_(sourceSs, [m.source].concat(m.sourceAliases || []));
     if (!sourceSheet) {
+      const checked = [m.source].concat(m.sourceAliases || []);
+      if (m.required === false) {
+        parts.push((m.target || m.source) + ': исходный лист не найден, пропущено (' + checked.join(', ') + ')');
+        return;
+      }
       throw new Error(
-        'Не найден исходный лист. Проверены имена: ' + [m.source].concat(m.sourceAliases || []).join(', ')
+        'Не найден исходный лист. Проверены имена: ' + checked.join(', ')
       );
     }
 
-    let targetSheet = targetSs.getSheetByName(m.target);
+    let targetSheet = syncHubFindSheetByNames_(targetSs, [m.target].concat(m.targetAliases || []));
     if (!targetSheet) {
-      parts.push(m.target + ': целевой лист отсутствует в 01, пропущено');
-      return;
+      if (createMissingTarget) {
+        if (dryRun) {
+          parts.push(m.target + ': dry-run, целевой лист отсутствует, был бы создан');
+          return;
+        }
+        targetSheet = targetSs.insertSheet(m.target);
+      } else {
+        parts.push(m.target + ': целевой лист отсутствует, пропущено');
+        return;
+      }
     }
 
     const rows = sourceSheet.getLastRow();
@@ -256,6 +612,18 @@ function syncHubCopyMappings_(sourceSs, targetSs, mappings, options) {
 
     if (!rows || !cols) {
       parts.push(m.target + ': источник пуст (rows=' + rows + ', cols=' + cols + '), пропущено');
+      return;
+    }
+
+    if (
+      sourceSs.getId() === targetSs.getId() &&
+      sourceSheet.getSheetId() === targetSheet.getSheetId()
+    ) {
+      parts.push(
+        m.target +
+          ': отменено — источник и цель один и тот же лист ' +
+          '(проверьте MASTER_REF_SPREADSHEET_ID и книгу получателя)'
+      );
       return;
     }
 
@@ -269,7 +637,8 @@ function syncHubCopyMappings_(sourceSs, targetSs, mappings, options) {
 
     for (let start = 1; start <= rows; start += batchSize) {
       const count = Math.min(batchSize, rows - start + 1);
-      const values = sourceSheet.getRange(start, 1, count, cols).getDisplayValues();
+      // Копируем вычисленные значения (в т.ч. результат IMPORTRANGE), не формулы.
+      const values = sourceSheet.getRange(start, 1, count, cols).getValues();
       targetSheet.getRange(start, 1, count, cols).setValues(values);
     }
     parts.push(m.target + ': ' + rows + ' строк, ' + cols + ' колонок');
@@ -350,10 +719,34 @@ function syncHubGetRequiredProp_(key) {
 function syncHubGetProp_(key, fallback) {
   const raw = PropertiesService.getScriptProperties().getProperty(key);
   if (raw == null || String(raw).trim() === '') return fallback;
-  return String(raw).trim();
+  const normalized = syncHubNormalizePropValue_(key, String(raw).trim());
+  return normalized;
 }
 
 function syncHubGetNumberProp_(key, fallback) {
   const n = Number(syncHubGetProp_(key, fallback));
   return isFinite(n) ? n : fallback;
+}
+
+/**
+ * Нормализует значения Script Properties.
+ * Для *_SPREADSHEET_ID пытается извлечь "чистый" id из URL/строки и убрать мусор.
+ */
+function syncHubNormalizePropValue_(key, value) {
+  const k = String(key || '');
+  const v = String(value == null ? '' : value).trim();
+  if (!v) return v;
+  if (k.indexOf('SPREADSHEET_ID') === -1) return v;
+  return syncHubExtractSpreadsheetId_(v);
+}
+
+function syncHubExtractSpreadsheetId_(raw) {
+  const s = String(raw == null ? '' : raw).trim();
+  if (!s) return '';
+  const mUrl = s.match(/\/spreadsheets\/d\/([a-zA-Z0-9-_]+)/);
+  if (mUrl && mUrl[1]) return mUrl[1];
+  const token = s.split(/[?#&\s]/)[0];
+  const mToken = token.match(/^([a-zA-Z0-9-_]{25,})/);
+  if (mToken && mToken[1]) return mToken[1];
+  return s;
 }
