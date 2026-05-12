@@ -31,6 +31,18 @@ const COST_CFG = {
 };
 
 function addCostingMenu_(ui) {
+  const batchesMenu = ui.createMenu('Партии_в_рейсе ← Сводная (01)')
+    .addItem('Безопасный (dry-run)', 'costingRebuildBatchesSafeDryRun')
+    .addItem('Безопасный (БОЕВОЙ)', 'costingRebuildBatchesSafeLive')
+    .addSeparator()
+    .addItem('Обновить количества (dry-run)', 'costingRebuildBatchesRefreshQtyDryRun')
+    .addItem('Обновить количества (БОЕВОЙ)', 'costingRebuildBatchesRefreshQtyLive')
+    .addSeparator()
+    .addItem('Полная пересборка (dry-run)', 'costingRebuildBatchesFullDryRun')
+    .addItem('Полная пересборка (БОЕВОЙ, двойное подтверждение)', 'costingRebuildBatchesFullLiveWithConfirm')
+    .addSeparator()
+    .addItem('Создать снимок «Партии_в_рейсе» сейчас', 'costingSnapshotBatchesMenu');
+
   ui.createMenu('💰 Себестоимость')
     .addItem('Проверка данных', 'costingHealthCheck_')
     .addItem('Подтянуть справочники из 04', 'costingSyncRefsFrom04_')
@@ -39,6 +51,8 @@ function addCostingMenu_(ui) {
     .addItem('Dry-run по рейсу (ввести SHIPMENT_ID)', 'costingDryRunByShipmentPrompt_')
     .addItem('Пересчитать себестоимость (расширенный)', 'rebuildCosting_')
     .addItem('Пересчитать себестоимость (сокращенный)', 'rebuildCostingSummary_')
+    .addSeparator()
+    .addSubMenu(batchesMenu)
     .addSeparator()
     .addItem('Создать недостающие листы', 'costingEnsureSheets_')
     .addToUi();
@@ -1401,11 +1415,9 @@ function costingNormSheetName_(s) {
 }
 
 function costingFindCol_(headerRow, aliases) {
-  const norm = headerRow.map(function (h) {
-    return String(h || '').toLowerCase().replace(/\s+/g, ' ').trim();
-  });
+  const norm = headerRow.map(costingHeaderCanonForLookup_);
   for (let i = 0; i < aliases.length; i++) {
-    const key = String(aliases[i]).toLowerCase().replace(/\s+/g, ' ').trim();
+    const key = costingHeaderCanonForLookup_(aliases[i]);
     const idx = norm.indexOf(key);
     if (idx !== -1) return idx;
   }
@@ -1413,15 +1425,31 @@ function costingFindCol_(headerRow, aliases) {
 }
 
 function costingFindColOptional_(headerRow, aliases) {
-  const norm = headerRow.map(function (h) {
-    return String(h || '').toLowerCase().replace(/\s+/g, ' ').trim();
-  });
+  const norm = headerRow.map(costingHeaderCanonForLookup_);
   for (let i = 0; i < aliases.length; i++) {
-    const key = String(aliases[i]).toLowerCase().replace(/\s+/g, ' ').trim();
+    const key = costingHeaderCanonForLookup_(aliases[i]);
     const idx = norm.indexOf(key);
     if (idx !== -1) return idx;
   }
   return null;
+}
+
+/**
+ * Единая канонизация заголовков для поиска колонок в costing.gs.
+ * Делает совместимость с разными вариантами написания: «№», «.», «,», «/», «\», «-», «_», скобки и т.п.
+ * Согласована с syncManagerCanonHeader_ в main.gs, чтобы не получать
+ * расхождения между Сводной и Партии_в_рейсе.
+ */
+function costingHeaderCanonForLookup_(h) {
+  return String(h == null ? '' : h)
+    .toLowerCase()
+    .replace(/ё/g, 'е')
+    .replace(/\u00A0/g, ' ')
+    .replace(/[№#]/g, ' ')
+    .replace(/[.,:;()/\\\[\]{}'"“”«»]/g, ' ')
+    .replace(/[-_]+/g, ' ')
+    .replace(/\s+/g, ' ')
+    .trim();
 }
 
 function costingFindSheetByRole_(ss, role) {
@@ -1509,4 +1537,708 @@ function costingGetProp_(key, fallback) {
 function costingGetNumberProp_(key, fallback) {
   const n = Number(costingGetProp_(key, fallback));
   return isFinite(n) ? n : fallback;
+}
+
+/**
+ * Открывает книгу 01 (Сводная-источник).
+ * 1) Если в проекте 05 есть sync_hub.gs (функция syncHubOpenSpreadsheetForBook_) — используем его.
+ * 2) Иначе самостоятельно читаем Script Property ORDERS_SPREADSHEET_ID, чистим её
+ *    (URL → id, обрезаем мусор) и открываем по ID.
+ * Это позволяет держать sync_hub.gs только в книге 04, не дублируя его в 05.
+ */
+function costingOpenBook01_() {
+  if (typeof syncHubOpenSpreadsheetForBook_ === 'function') {
+    return syncHubOpenSpreadsheetForBook_('01');
+  }
+  const raw = costingGetProp_('ORDERS_SPREADSHEET_ID', '');
+  if (!raw) {
+    throw new Error(
+      'Не задан Script Property ORDERS_SPREADSHEET_ID в книге 05.\n' +
+      'Откройте Расширения → Apps Script → ⚙ Свойства проекта → Свойства скрипта и добавьте:\n' +
+      '  ORDERS_SPREADSHEET_ID = <ID или URL книги 01>'
+    );
+  }
+  const id = costingExtractSpreadsheetId_(raw);
+  if (!id) {
+    throw new Error('ORDERS_SPREADSHEET_ID указан, но не удалось извлечь корректный ID: ' + raw);
+  }
+  try {
+    return SpreadsheetApp.openById(id);
+  } catch (e) {
+    throw new Error(
+      'Не удалось открыть книгу 01 по ORDERS_SPREADSHEET_ID = ' + id + '\n' +
+      'Проверьте доступ исполнителя скрипта к этому файлу и корректность ID.\n' +
+      'Исходная ошибка: ' + (e && e.message ? e.message : String(e))
+    );
+  }
+}
+
+function costingExtractSpreadsheetId_(raw) {
+  const s = String(raw == null ? '' : raw).trim();
+  if (!s) return '';
+  const mUrl = s.match(/\/spreadsheets\/d\/([a-zA-Z0-9-_]+)/);
+  if (mUrl && mUrl[1]) return mUrl[1];
+  const token = s.split(/[?#&\s]/)[0];
+  const mToken = token.match(/^([a-zA-Z0-9-_]{25,})/);
+  if (mToken && mToken[1]) return mToken[1];
+  return s;
+}
+
+/* =================================================================================
+ * Пересборка «Партии_в_рейсе» (книга 05) из «Сводной» (книга 01) по SHIPMENT_ID.
+ *
+ * Архитектурно: «Сводная» (01) — источник истины операционных данных, «Партии_в_рейсе»
+ * (05) — производная для расчёта себестоимости. Эта функция переносит позиции с
+ * заполненным SHIPMENT_ID из «Сводной» в «Партии_в_рейсе».
+ *
+ * Поддерживаемые режимы:
+ *   - 'safe' (по умолчанию): добавляет в Партии_в_рейсе только те (SHIPMENT_ID, Артикул ВБ),
+ *     которых там нет. Существующие строки НЕ ТРОГАЕТ (защита ручных правок цен/курсов/ТНВЭД).
+ *   - 'refresh_qty': то же что safe + для существующих строк обновляет ТОЛЬКО Количество и Объем.
+ *     Все остальные поля (Стоимость, Цена, Валюта, Курс, ТНВЭД и т.п.) сохраняются.
+ *   - 'full_rebuild': удаляет все строки в Партии_в_рейсе и пишет заново. Требует двойного
+ *     подтверждения через UI (см. costingRebuildBatchesFullLiveWithConfirm).
+ *
+ * Защита: при любом боевом запуске (dryRun=false) автоматически делается снимок
+ * Партии_в_рейсе → лист «Партии_в_рейсе_бэкап_YYYYMMDD_hhmm». Лог пишется в книгу 04
+ * через syncHubLog_ (если функция доступна).
+ *
+ * @param {{ mode?: 'safe'|'refresh_qty'|'full_rebuild', dryRun?: boolean }} opts
+ * @returns {Object} отчёт по операции
+ * ============================================================================== */
+function costingRebuildBatchesFromSummary_(opts) {
+  const mode = (opts && opts.mode) || 'safe';
+  const dryRun = !!(opts && opts.dryRun);
+  if (['safe', 'refresh_qty', 'full_rebuild'].indexOf(mode) === -1) {
+    throw new Error('Неизвестный режим: ' + mode);
+  }
+
+  const sourceSs = costingOpenBook01_();
+  const summarySh = sourceSs.getSheetByName('Сводная');
+  if (!summarySh) throw new Error('В книге 01 не найден лист «Сводная».');
+
+  const targetSs = SpreadsheetApp.getActiveSpreadsheet();
+  const batchesSh = costingGetSheetByRole_(targetSs, 'BATCHES');
+
+  const summaryRows = costingReadSummaryShipmentRows_(summarySh);
+
+  const batchesData = batchesSh.getDataRange().getValues();
+  if (batchesData.length === 0) {
+    throw new Error('В листе «' + batchesSh.getName() + '» отсутствует шапка. Заполните строку 1.');
+  }
+  const batchesHeader = batchesData[0];
+  const bIdxShipment = costingFindCol_(batchesHeader, ['SHIPMENT_ID', 'ID_рейса']);
+  const bIdxSku = costingFindCol_(batchesHeader, ['Артикул ВБ', 'Артикул_ВБ', 'WB_ARTICLE']);
+  const bIdxQty = costingFindColOptional_(batchesHeader, ['Количество', 'Qty', 'QTY']);
+  const bIdxVolume = costingFindColOptional_(batchesHeader, ['Объем', 'Объём', 'Volume']);
+
+  const existingByKey = {};
+  for (let r = 1; r < batchesData.length; r++) {
+    const sh = String(batchesData[r][bIdxShipment] || '').trim();
+    const sku = String(batchesData[r][bIdxSku] || '').trim();
+    if (!sh || !sku) continue;
+    existingByKey[sh + '|' + sku] = { rowIdx: r, row: batchesData[r] };
+  }
+
+  const tripsRegistry = costingLoadTripsRegistry_(targetSs);
+
+  const added = [];
+  const updated = [];
+  const unchanged = [];
+  const unknownTrSet = {};
+  const reportByShipment = {};
+
+  function reportInc_(shipId, bucket) {
+    if (!reportByShipment[shipId]) {
+      reportByShipment[shipId] = { added: 0, updated: 0, unchanged: 0, overwritten: 0, total: 0 };
+    }
+    reportByShipment[shipId][bucket]++;
+    reportByShipment[shipId].total++;
+  }
+
+  for (let i = 0; i < summaryRows.length; i++) {
+    const sr = summaryRows[i];
+    const key = sr.shipmentId + '|' + sr.wbArticle;
+
+    if (Object.keys(tripsRegistry).length && !tripsRegistry[sr.shipmentId]) {
+      unknownTrSet[sr.shipmentId] = true;
+    }
+
+    if (mode === 'full_rebuild') {
+      added.push({ row: sr, batchRow: costingBuildBatchRowFromSummary_(sr, batchesHeader) });
+      reportInc_(sr.shipmentId, 'overwritten');
+      continue;
+    }
+
+    const existing = existingByKey[key];
+    if (!existing) {
+      added.push({ row: sr, batchRow: costingBuildBatchRowFromSummary_(sr, batchesHeader) });
+      reportInc_(sr.shipmentId, 'added');
+      continue;
+    }
+
+    if (mode === 'refresh_qty') {
+      const oldQty = bIdxQty != null ? costingToNumber_(existing.row[bIdxQty]) : 0;
+      const newQty = costingToNumber_(sr.qty);
+      const oldVolume = bIdxVolume != null ? costingToNumber_(existing.row[bIdxVolume]) : 0;
+      const newVolume = costingToNumber_(sr.volume);
+      const qtyDiff = Math.abs(oldQty - newQty) > 1e-9;
+      const volDiff = Math.abs(oldVolume - newVolume) > 1e-9;
+      if (qtyDiff || volDiff) {
+        updated.push({
+          row: sr,
+          rowIdx: existing.rowIdx,
+          newQty: newQty,
+          newVolume: newVolume,
+          oldQty: oldQty,
+          oldVolume: oldVolume
+        });
+        reportInc_(sr.shipmentId, 'updated');
+      } else {
+        unchanged.push({ row: sr });
+        reportInc_(sr.shipmentId, 'unchanged');
+      }
+    } else {
+      // safe mode
+      unchanged.push({ row: sr });
+      reportInc_(sr.shipmentId, 'unchanged');
+    }
+  }
+
+  // Превью первых добавляемых строк — чтобы в dry-run сразу увидеть, какие поля
+  // (ШК, спецификация, коробки, в коробке, валюта) реально считались из Сводной.
+  const previewSize = Math.min(added.length, 5);
+  const addedPreview = [];
+  for (let p = 0; p < previewSize; p++) {
+    const a = added[p].row;
+    addedPreview.push({
+      shipmentId: a.shipmentId,
+      wbArticle: a.wbArticle,
+      barcode: a.barcode,
+      spec: a.spec,
+      qty: costingToNumber_(a.qty),
+      qtyPerBox: a.qtyPerBox === '' || a.qtyPerBox == null ? '' : costingToNumber_(a.qtyPerBox),
+      boxes: a.boxes === '' || a.boxes == null ? '' : costingToNumber_(a.boxes),
+      price: costingToNumber_(a.price),
+      amount: costingToNumber_(a.amount),
+      currency: a.currency || ''
+    });
+  }
+
+  const summary = {
+    mode: mode,
+    dryRun: dryRun,
+    summarySourceCount: summaryRows.length,
+    addedCount: added.length,
+    updatedCount: updated.length,
+    unchangedCount: unchanged.length,
+    overwrittenCount: mode === 'full_rebuild' ? added.length : 0,
+    unknownTrCount: Object.keys(unknownTrSet).length,
+    unknownTrList: Object.keys(unknownTrSet).sort(),
+    reportByShipment: reportByShipment,
+    addedPreview: addedPreview
+  };
+
+  if (dryRun) return summary;
+
+  if (summary.addedCount === 0 && summary.updatedCount === 0 && summary.overwrittenCount === 0) {
+    summary.snapshotName = null;
+    return summary;
+  }
+
+  summary.snapshotName = costingSnapshotBatches_(targetSs);
+
+  if (mode === 'full_rebuild') {
+    const totalRows = batchesSh.getLastRow();
+    if (totalRows > 1) {
+      batchesSh.getRange(2, 1, totalRows - 1, batchesHeader.length).clearContent();
+    }
+    const newRows = added.map(function (a) { return a.batchRow; });
+    if (newRows.length) {
+      batchesSh.getRange(2, 1, newRows.length, batchesHeader.length).setValues(newRows);
+    }
+  } else {
+    if (added.length) {
+      const startRow = batchesSh.getLastRow() + 1;
+      const newRows = added.map(function (a) { return a.batchRow; });
+      batchesSh.getRange(startRow, 1, newRows.length, batchesHeader.length).setValues(newRows);
+    }
+    if (mode === 'refresh_qty' && updated.length) {
+      for (let u = 0; u < updated.length; u++) {
+        const upd = updated[u];
+        if (bIdxQty != null) {
+          batchesSh.getRange(upd.rowIdx + 1, bIdxQty + 1).setValue(upd.newQty);
+        }
+        if (bIdxVolume != null) {
+          batchesSh.getRange(upd.rowIdx + 1, bIdxVolume + 1).setValue(upd.newVolume);
+        }
+      }
+    }
+  }
+
+  costingSortBatches_(batchesSh, batchesHeader);
+  return summary;
+}
+
+/**
+ * Чтение строк «Сводной» (книга 01) с непустым SHIPMENT_ID.
+ * Шапка в строке 2, данные с 3-й (см. MANAGER_SUMMARY_SYNC_HEADER_ROW в книге 01).
+ */
+function costingReadSummaryShipmentRows_(summarySh) {
+  const lr = summarySh.getLastRow();
+  const lc = summarySh.getLastColumn();
+  if (lr < 3 || lc < 1) return [];
+
+  const headerRow = summarySh.getRange(2, 1, 1, lc).getValues()[0] || [];
+  const idxShipment = costingFindColOptional_(headerRow, ['Рейс', 'SHIPMENT_ID', 'Shipment_ID', 'ID_рейса']);
+  if (idxShipment == null) {
+    throw new Error(
+      'В «Сводной» книги 01 не найдена колонка «Рейс» / «SHIPMENT_ID». ' +
+        'Добавьте колонку в манерные вкладки или в «История отгрузок» и пересоберите Сводную.'
+    );
+  }
+  const idxWb = costingFindCol_(headerRow, ['Артикул ВБ', 'Артикул_ВБ', 'WB_ARTICLE']);
+  const idxSupArticle = costingFindColOptional_(headerRow, ['Артикул поставщика', 'Артикул_поставщика']);
+  const idxBarcode = costingFindColOptional_(headerRow, ['ШК', 'Barcode', 'Штрихкод']);
+  const idxQty = costingFindColOptional_(headerRow, ['Итоговое количество', 'Количество', 'Qty', 'QTY']);
+  const idxQtyPerBox = costingFindColOptional_(headerRow, [
+    'Количество в коробке',
+    'Количество_в_коробке',
+    'Кол-во в коробке',
+    'Кол_во в коробке',
+    'Штук в коробке',
+    'Шт в коробке',
+    'Единиц в коробке',
+    'В коробке',
+    'Qty per box',
+    'Pcs per box',
+    'Pcs box',
+    'Per box'
+  ]);
+  const idxBoxes = costingFindColOptional_(headerRow, [
+    'Коробки',
+    'Кол-во коробок',
+    'Кол_во коробок',
+    'Количество коробок',
+    'Число коробок',
+    'Итого коробок',
+    // Вариант с «коробов» (от слова «короб»), часто встречается в шапках логистов
+    'Количество коробов',
+    'Кол-во коробов',
+    'Кол_во коробов',
+    'Число коробов',
+    'Итого коробов',
+    'Boxes',
+    'Box count',
+    'Total boxes',
+    'CTN',
+    'CTNS',
+    'Cartons'
+  ]);
+  const idxPrice = costingFindColOptional_(headerRow, ['Цена', 'Price']);
+  const idxAmount = costingFindColOptional_(headerRow, ['Сумма', 'Amount']);
+  const idxVolume = costingFindColOptional_(headerRow, ['Объем', 'Объём', 'Volume']);
+  const idxWeight = costingFindColOptional_(headerRow, ['Вес', 'Weight']);
+  const idxSpec = costingFindColOptional_(headerRow, [
+    'Номер спецификации',
+    'Номер_спецификации',
+    'Спецификация',
+    'Спецификации',
+    'Номер спецификации /инвойса',
+    'Номер спецификации/инвойса',
+    'Спецификация /инвойса',
+    'Спецификация/инвойса',
+    'Номер инвойса',
+    'Инвойс',
+    'Spec',
+    'Spec number',
+    '№ спецификации',
+    '№спецификации'
+  ]);
+  const idxCurrency = costingFindColOptional_(headerRow, ['Валюта', 'Currency', 'Curr']);
+  const idxSupplierNote = costingFindColOptional_(headerRow, ['Поставщик']);
+  const idxShipVia = costingFindColOptional_(headerRow, ['Отгрузка через', 'Отгрузка_через']);
+
+  const data = summarySh.getRange(3, 1, lr - 2, lc).getValues();
+  const dataDisplay = summarySh.getRange(3, 1, lr - 2, lc).getDisplayValues();
+  const rows = [];
+  for (let i = 0; i < data.length; i++) {
+    const r = data[i];
+    const d = dataDisplay[i];
+    // Пропускаем строки-разделители месяцев (стартуют с «▸»)
+    const firstCell = String(r[0] || '').trim();
+    if (firstCell.indexOf('▸') === 0) continue;
+    const shipId = String(r[idxShipment] || '').trim();
+    const wb = String(r[idxWb] || '').trim();
+    if (!shipId || !wb) continue;
+    rows.push({
+      shipmentId: shipId,
+      wbArticle: wb,
+      supplierArticle: idxSupArticle != null ? String(r[idxSupArticle] || '').trim() : '',
+      barcode: idxBarcode != null ? String(r[idxBarcode] || '').trim() : '',
+      qty: idxQty != null ? r[idxQty] : 0,
+      qtyPerBox: idxQtyPerBox != null ? r[idxQtyPerBox] : '',
+      boxes: idxBoxes != null ? r[idxBoxes] : '',
+      price: idxPrice != null ? r[idxPrice] : 0,
+      amount: idxAmount != null ? r[idxAmount] : 0,
+      volume: idxVolume != null ? r[idxVolume] : 0,
+      weight: idxWeight != null ? r[idxWeight] : 0,
+      spec: idxSpec != null ? (String(r[idxSpec] || '').trim() || String(d[idxSpec] || '').trim()) : '',
+      currency: idxCurrency != null ? String(r[idxCurrency] || '').trim() : '',
+      supplier: idxSupplierNote != null ? String(r[idxSupplierNote] || '').trim() : '',
+      shipVia: idxShipVia != null ? String(r[idxShipVia] || '').trim() : ''
+    });
+  }
+  return rows;
+}
+
+/**
+ * Строит строку «Партии_в_рейсе» из row-объекта «Сводной».
+ *
+ * Контракт по валютам:
+ *   • Все денежные поля в «Партии_в_рейсе» (Цена, Сумма итого / Стоимость) остаются
+ *     в валюте заказа (обычно CNY). Перевод в рубли НЕ делается — это задача листа
+ *     «Себестоимость SKU», который использует «Курс к RUB» уже на этапе расчёта.
+ *   • Валюта по умолчанию — CNY. Перегружается Script Property BATCHES_DEFAULT_CURRENCY
+ *     (значения 'CNY' / 'RUB' / 'USD' и т.п.). Если в строке Сводной есть колонка «Валюта»
+ *     с непустым значением — она имеет приоритет (per-row override).
+ *   • Курс к RUB не заполняется автоматически — пользователь проставляет его руками
+ *     для конкретной партии (это конверсионный курс к моменту закупки/оплаты).
+ */
+function costingBuildBatchRowFromSummary_(sr, batchesHeader) {
+  const row = new Array(batchesHeader.length).fill('');
+  const idxShipment = costingFindCol_(batchesHeader, ['SHIPMENT_ID', 'ID_рейса']);
+  const idxSku = costingFindCol_(batchesHeader, ['Артикул ВБ', 'Артикул_ВБ', 'WB_ARTICLE']);
+  const idxSupArticle = costingFindColOptional_(batchesHeader, ['Артикул поставщика', 'Артикул_поставщика']);
+  const idxBarcode = costingFindColOptional_(batchesHeader, ['ШК', 'Barcode', 'Штрихкод']);
+  const idxQty = costingFindColOptional_(batchesHeader, ['Количество', 'Qty', 'QTY']);
+  const idxQtyPerBox = costingFindColOptional_(batchesHeader, [
+    'Количество в коробке',
+    'Количество_в_коробке',
+    'Кол-во в коробке',
+    'Кол_во в коробке',
+    'Штук в коробке',
+    'Шт в коробке',
+    'Единиц в коробке',
+    'В коробке',
+    'Qty per box',
+    'Pcs per box',
+    'Pcs box',
+    'Per box'
+  ]);
+  const idxBoxes = costingFindColOptional_(batchesHeader, [
+    'Коробки',
+    'Кол-во коробок',
+    'Кол_во коробок',
+    'Количество коробок',
+    'Число коробок',
+    'Итого коробок',
+    // Вариант с «коробов»
+    'Количество коробов',
+    'Кол-во коробов',
+    'Кол_во коробов',
+    'Число коробов',
+    'Итого коробов',
+    'Boxes',
+    'Box count',
+    'Total boxes',
+    'CTN',
+    'CTNS',
+    'Cartons'
+  ]);
+  // «Сумма итого» в «Партии_в_рейсе» — это qty × price в валюте партии (НЕ в рублях).
+  // Поддерживаем разные варианты названия колонки в реальных листах.
+  const idxAmount = costingFindColOptional_(batchesHeader, [
+    'Сумма итого',
+    'Сумма_итого',
+    'Сумма',
+    'Total amount',
+    'Total',
+    'Стоимость',
+    'Закупка_руб',
+    'Закупка руб'
+  ]);
+  const idxPrice = costingFindColOptional_(batchesHeader, ['Цена', 'Цена_RUB', 'Цена руб', 'Price']);
+  const idxCurrency = costingFindColOptional_(batchesHeader, ['Валюта', 'Currency']);
+  const idxShipVia = costingFindColOptional_(batchesHeader, [
+    'Отгрузка через',
+    'Отгрузка_через',
+    'Supplier'
+  ]);
+  const idxSupplier = costingFindColOptional_(batchesHeader, ['Поставщик']);
+  const idxVolume = costingFindColOptional_(batchesHeader, ['Объем', 'Объём', 'Volume']);
+  const idxWeight = costingFindColOptional_(batchesHeader, ['Вес', 'Weight']);
+  const idxSpec = costingFindColOptional_(batchesHeader, [
+    'Номер спецификации',
+    'Номер_спецификации',
+    'Спецификация',
+    'Спецификации',
+    'Номер спецификации /инвойса',
+    'Номер спецификации/инвойса',
+    'Спецификация /инвойса',
+    'Спецификация/инвойса',
+    'Номер инвойса',
+    'Инвойс',
+    'Spec',
+    'Spec number',
+    '№ спецификации',
+    '№спецификации'
+  ]);
+
+  const defaultCurrency = costingGetProp_('BATCHES_DEFAULT_CURRENCY', 'CNY') || 'CNY';
+  const rowCurrency = String(sr.currency || '').trim().toUpperCase() || defaultCurrency.toUpperCase();
+
+  row[idxShipment] = sr.shipmentId;
+  row[idxSku] = sr.wbArticle;
+  if (idxSupArticle != null) row[idxSupArticle] = sr.supplierArticle;
+  if (idxBarcode != null) row[idxBarcode] = sr.barcode;
+  if (idxSpec != null) row[idxSpec] = sr.spec;
+  if (idxQty != null) row[idxQty] = costingToNumber_(sr.qty);
+  if (idxQtyPerBox != null && sr.qtyPerBox !== '' && sr.qtyPerBox !== null && sr.qtyPerBox !== undefined) {
+    row[idxQtyPerBox] = costingToNumber_(sr.qtyPerBox);
+  }
+  if (idxBoxes != null && sr.boxes !== '' && sr.boxes !== null && sr.boxes !== undefined) {
+    row[idxBoxes] = costingToNumber_(sr.boxes);
+  }
+  // Сумма итого = qty × price из Сводной, остаётся в валюте заказа.
+  if (idxAmount != null) row[idxAmount] = costingToNumber_(sr.amount);
+  if (idxPrice != null) row[idxPrice] = costingToNumber_(sr.price);
+  if (idxCurrency != null) row[idxCurrency] = rowCurrency;
+  // Курс к RUB заполняет пользователь (или отдельный механизм с курсами).
+  // Не подставляем «1» по умолчанию, чтобы потом в «Себестоимость SKU» не было
+  // случайной конверсии CNY → RUB по ложному курсу.
+  if (idxShipVia != null) row[idxShipVia] = sr.shipVia;
+  if (idxSupplier != null) row[idxSupplier] = sr.supplier;
+  if (idxVolume != null) row[idxVolume] = costingToNumber_(sr.volume);
+  if (idxWeight != null) row[idxWeight] = costingToNumber_(sr.weight);
+
+  return row;
+}
+
+function costingLoadTripsRegistry_(ss) {
+  const sh = costingFindSheetByRole_(ss, 'TRIPS');
+  if (!sh) return {};
+  const data = sh.getDataRange().getValues();
+  if (data.length < 2) return {};
+  const idx = costingFindColOptional_(data[0], ['SHIPMENT_ID', 'ID_рейса', 'Рейс']);
+  if (idx == null) return {};
+  const reg = {};
+  for (let i = 1; i < data.length; i++) {
+    const id = String(data[i][idx] || '').trim();
+    if (id) reg[id] = true;
+  }
+  return reg;
+}
+
+/**
+ * Делает копию «Партии_в_рейсе» с именем «Партии_в_рейсе_бэкап_YYYYMMDD_hhmm» в той же книге.
+ * Возвращает имя созданного листа.
+ */
+function costingSnapshotBatches_(ss) {
+  ss = ss || SpreadsheetApp.getActiveSpreadsheet();
+  const sh = costingGetSheetByRole_(ss, 'BATCHES');
+  const now = new Date();
+  const stamp =
+    now.getFullYear() +
+    String(now.getMonth() + 1).padStart(2, '0') +
+    String(now.getDate()).padStart(2, '0') +
+    '_' +
+    String(now.getHours()).padStart(2, '0') +
+    String(now.getMinutes()).padStart(2, '0');
+  const base = COST_CFG.SHEETS.BATCHES + '_бэкап_' + stamp;
+  let finalName = base;
+  let suffix = 2;
+  while (ss.getSheetByName(finalName)) {
+    finalName = base + '_' + suffix;
+    suffix++;
+  }
+  const copied = sh.copyTo(ss);
+  copied.setName(finalName);
+  try {
+    ss.setActiveSheet(copied);
+    ss.moveActiveSheet(ss.getNumSheets());
+  } catch (e) {}
+  return finalName;
+}
+
+function costingSortBatches_(batchesSh, batchesHeader) {
+  const lr = batchesSh.getLastRow();
+  if (lr < 3) return;
+  const idxShipment = costingFindCol_(batchesHeader, ['SHIPMENT_ID', 'ID_рейса']);
+  const idxSku = costingFindCol_(batchesHeader, ['Артикул ВБ', 'Артикул_ВБ', 'WB_ARTICLE']);
+  try {
+    batchesSh.getRange(2, 1, lr - 1, batchesHeader.length).sort([
+      { column: idxShipment + 1, ascending: true },
+      { column: idxSku + 1, ascending: true }
+    ]);
+  } catch (e) {
+    // Если сортировка не удалась — не критично, оставляем как есть.
+  }
+}
+
+/* ------------------ Пункты меню для пересборки ------------------ */
+
+function costingRebuildBatchesSafeDryRun() {
+  costingRebuildBatchesMenuAction_({ mode: 'safe', dryRun: true });
+}
+function costingRebuildBatchesSafeLive() {
+  costingRebuildBatchesMenuAction_({ mode: 'safe', dryRun: false });
+}
+function costingRebuildBatchesRefreshQtyDryRun() {
+  costingRebuildBatchesMenuAction_({ mode: 'refresh_qty', dryRun: true });
+}
+function costingRebuildBatchesRefreshQtyLive() {
+  costingRebuildBatchesMenuAction_({ mode: 'refresh_qty', dryRun: false });
+}
+function costingRebuildBatchesFullDryRun() {
+  costingRebuildBatchesMenuAction_({ mode: 'full_rebuild', dryRun: true });
+}
+function costingRebuildBatchesFullLiveWithConfirm() {
+  const ui = SpreadsheetApp.getUi();
+  const r1 = ui.alert(
+    '⚠️ ПОЛНАЯ ПЕРЕСБОРКА «Партии_в_рейсе»',
+    'Эта операция удалит ВСЕ строки в «Партии_в_рейсе» и запишет заново из «Сводной» книги 01.\n' +
+      'Все ручные правки цен, валют, курсов, ТНВЭД для уже занесённых рейсов БУДУТ ПОТЕРЯНЫ.\n\n' +
+      'Перед операцией будет создан автоматический снимок.\n\nПродолжить?',
+    ui.ButtonSet.YES_NO
+  );
+  if (r1 !== ui.Button.YES) return;
+  const r2 = ui.alert(
+    '⚠️ Повторное подтверждение',
+    'Точно полностью пересобрать «Партии_в_рейсе»? Восстановление возможно только из снимка.',
+    ui.ButtonSet.YES_NO
+  );
+  if (r2 !== ui.Button.YES) return;
+  costingRebuildBatchesMenuAction_({ mode: 'full_rebuild', dryRun: false });
+}
+
+function costingSnapshotBatchesMenu() {
+  const ui = SpreadsheetApp.getUi();
+  try {
+    const name = costingSnapshotBatches_(SpreadsheetApp.getActiveSpreadsheet());
+    ui.alert('✅ Снимок создан', 'Лист: ' + name, ui.ButtonSet.OK);
+  } catch (e) {
+    ui.alert('❌ Не удалось создать снимок', e.message || String(e), ui.ButtonSet.OK);
+  }
+}
+
+function costingRebuildBatchesMenuAction_(opts) {
+  const ui = SpreadsheetApp.getUi();
+  try {
+    const report = costingRebuildBatchesFromSummary_(opts);
+    const modeLabels = {
+      safe: 'безопасный',
+      refresh_qty: 'обновление количеств',
+      full_rebuild: 'полная пересборка'
+    };
+    const lines = [];
+    lines.push('Режим: ' + modeLabels[opts.mode] + (opts.dryRun ? ' (DRY-RUN)' : ' (БОЕВОЙ)'));
+    lines.push('Строк в «Сводной» с SHIPMENT_ID: ' + report.summarySourceCount);
+    lines.push('');
+    if (opts.mode === 'full_rebuild') {
+      lines.push('Будет перезаписано строк: ' + report.overwrittenCount);
+    } else {
+      lines.push('Добавится: ' + report.addedCount);
+      if (opts.mode === 'refresh_qty') {
+        lines.push('Обновится (qty/объём): ' + report.updatedCount);
+      }
+      lines.push('Без изменений: ' + report.unchangedCount);
+    }
+    lines.push('');
+    lines.push('По рейсам:');
+    const ships = Object.keys(report.reportByShipment).sort();
+    if (!ships.length) {
+      lines.push('  (нет рейсов в «Сводной»)');
+    } else {
+      for (let i = 0; i < ships.length; i++) {
+        const r = report.reportByShipment[ships[i]];
+        const parts = [];
+        if (r.added) parts.push('добавится ' + r.added);
+        if (r.updated) parts.push('обновится ' + r.updated);
+        if (r.unchanged) parts.push('без изм. ' + r.unchanged);
+        if (r.overwritten) parts.push('перезапишется ' + r.overwritten);
+        lines.push('  ' + ships[i] + ': ' + parts.join(', '));
+      }
+    }
+    if (report.unknownTrCount) {
+      lines.push('');
+      lines.push(
+        '⚠️ Не найдены в листе «Рейсы»: ' +
+          report.unknownTrList.join(', ') +
+          ' — проверьте формат или заведите рейс в «Рейсы».'
+      );
+    }
+    if (report.addedPreview && report.addedPreview.length) {
+      lines.push('');
+      lines.push('Превью первых добавляемых строк (что реально считалось из Сводной):');
+      for (let p = 0; p < report.addedPreview.length; p++) {
+        const a = report.addedPreview[p];
+        lines.push(
+          '  • ' + a.shipmentId + ' / ' + a.wbArticle +
+            ' | ШК: ' + (a.barcode || '∅') +
+            ' | Спец: ' + (a.spec || '∅') +
+            ' | qty: ' + a.qty +
+            ' | в коробке: ' + (a.qtyPerBox === '' ? '∅' : a.qtyPerBox) +
+            ' | коробки: ' + (a.boxes === '' ? '∅' : a.boxes) +
+            ' | цена: ' + a.price +
+            ' | сумма: ' + a.amount +
+            ' | вал: ' + (a.currency || '(default)')
+        );
+      }
+      if (report.addedCount > report.addedPreview.length) {
+        lines.push('  … и ещё ' + (report.addedCount - report.addedPreview.length) + ' строк');
+      }
+    }
+    if (!opts.dryRun && report.snapshotName) {
+      lines.push('');
+      lines.push('Снимок создан: ' + report.snapshotName);
+    } else if (!opts.dryRun && !report.snapshotName) {
+      lines.push('');
+      lines.push('Изменений не было — снимок не создавался.');
+    }
+
+    if (typeof syncHubLog_ === 'function') {
+      try {
+        syncHubLog_(
+          'costing.rebuildBatchesFromSummary',
+          opts.dryRun ? 'DRY-RUN' : 'OK',
+          'mode=' +
+            opts.mode +
+            '; source=' +
+            report.summarySourceCount +
+            '; added=' +
+            report.addedCount +
+            '; updated=' +
+            report.updatedCount +
+            '; unchanged=' +
+            report.unchangedCount +
+            '; overwritten=' +
+            report.overwrittenCount +
+            '; unknown_tr=' +
+            report.unknownTrCount +
+            (report.snapshotName ? '; snapshot=' + report.snapshotName : ''),
+          opts.dryRun
+        );
+      } catch (e) {}
+    }
+
+    ui.alert(
+      opts.dryRun ? '🧪 Dry-run завершён' : '✅ Пересборка завершена',
+      lines.join('\n'),
+      ui.ButtonSet.OK
+    );
+  } catch (e) {
+    if (typeof syncHubLog_ === 'function') {
+      try {
+        syncHubLog_(
+          'costing.rebuildBatchesFromSummary',
+          'ERROR',
+          'mode=' + opts.mode + '; error=' + (e.message || String(e)),
+          opts.dryRun
+        );
+      } catch (logErr) {}
+    }
+    ui.alert('❌ Ошибка', e.message || String(e), ui.ButtonSet.OK);
+    throw e;
+  }
 }

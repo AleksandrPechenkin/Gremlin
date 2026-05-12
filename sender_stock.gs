@@ -167,7 +167,18 @@ function buildStockEventsFromSheet_(sheet, statusEventMap) {
   const hmap = indexMapStock_(headers);
 
   const idxStatus = findHeaderStock_(hmap, ['Статус заказа'], 11);
-  const idxSpec = findHeaderStock_(hmap, ['Номер спецификации', 'Номер Спецификации'], 12);
+  const idxSpec = findHeaderStock_(
+    hmap,
+    [
+      'Номер спецификации',
+      'Номер Спецификации',
+      'Номер спецификации /инвойса',
+      'Номер Спецификации /инвойса',
+      'Спецификация',
+      'Номер инвойса'
+    ],
+    12
+  );
   const idxArticle = findHeaderStock_(hmap, ['Артикул ВБ', 'Артикул WB'], 1);
   const idxBarcode = findHeaderStock_(hmap, ['ШК', 'Barcode'], 3);
   const idxSupplier = findHeaderStock_(hmap, ['Поставщик'], 9);
@@ -381,6 +392,12 @@ function shipViaNoTransitKeys_() {
 }
 
 function toNumStock_(v) {
+  if (v instanceof Date) {
+    if (isNaN(v.getTime())) return 0;
+    const epoch = new Date(1899, 11, 30).getTime();
+    const serial = (v.getTime() - epoch) / 86400000;
+    return isFinite(serial) ? serial : 0;
+  }
   if (typeof v === 'number') return isFinite(v) ? v : 0;
   const s = String(v || '').replace(/\s/g, '').replace(',', '.');
   const n = parseFloat(s);
@@ -515,7 +532,18 @@ function buildShipmentForecastFromReadyDate() {
   const idxReady = findHeaderStock_(hmap, ['Дата готовности'], 13);
   const idxSender = findHeaderStock_(hmap, ['Отгрузка через'], 17);
   const idxArticle = findHeaderStock_(hmap, ['Артикул ВБ', 'Артикул WB'], 1);
-  const idxSpec = findHeaderStock_(hmap, ['Номер спецификации', 'Номер Спецификации'], 12);
+  const idxSpec = findHeaderStock_(
+    hmap,
+    [
+      'Номер спецификации',
+      'Номер Спецификации',
+      'Номер спецификации /инвойса',
+      'Номер Спецификации /инвойса',
+      'Спецификация',
+      'Номер инвойса'
+    ],
+    12
+  );
   const idxQty = findHeaderStock_(hmap, ['Итоговое количество', 'Количество'], 7);
   const idxVolume = findHeaderStock_(hmap, ['Объем', 'Volume'], 16);
   const idxWeight = findHeaderStock_(hmap, ['Вес', 'Weight'], 17);
