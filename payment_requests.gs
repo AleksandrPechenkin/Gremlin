@@ -80,21 +80,78 @@ function payCanon_(v) {
   return payNorm_(v).toLowerCase().replace(/\s+/g, '');
 }
 
+/**
+ * Канонизация именно ЗАГОЛОВКОВ листа (а не произвольных значений в строках).
+ * Согласована с `syncManagerCanonHeader_` (main.gs): «№», «#», точки, скобки,
+ * слэши, кавычки, дефисы и подчёркивания → пробел; NBSP → space; ё → е.
+ * Без этого «№ спецификации», «Номер_спецификации», «Спецификация/инвойс»
+ * не матчатся с «Номер спецификации», и `payFindCol_` молча падает в фолбэк
+ * (что давало баг «вместо номера спецификации тянется сумма»).
+ */
+function payHeaderCanon_(s) {
+  return String(s == null ? '' : s)
+    .toLowerCase()
+    .replace(/ё/g, 'е')
+    .replace(/\u00A0/g, ' ')
+    .replace(/[№#]/g, ' ')
+    .replace(/[.,:;()/\\\[\]{}'"“”«»]/g, ' ')
+    .replace(/[-_]+/g, ' ')
+    .replace(/\s+/g, ' ')
+    .trim();
+}
+
 function payHeaderMap_(headers) {
   const map = {};
   for (let i = 0; i < headers.length; i++) {
-    const k = payCanon_(headers[i]);
-    if (k) map[k] = i;
+    const k = payHeaderCanon_(headers[i]);
+    if (k && map[k] == null) map[k] = i;
   }
   return map;
 }
 
-function payFindCol_(map, keys, fallback1Based) {
-  for (let i = 0; i < keys.length; i++) {
-    const hit = map[payCanon_(keys[i])];
+/**
+ * Поиск колонки по списку алиасов. Возвращает 0-based индекс или -1.
+ * В отличие от старой версии НЕ имеет фолбэка на цифровой номер — если
+ * колонку не нашли, caller обязан сообщить пользователю осмысленную ошибку.
+ */
+function payFindHeaderCol_(map, aliases) {
+  for (let i = 0; i < aliases.length; i++) {
+    const hit = map[payHeaderCanon_(aliases[i])];
     if (hit != null) return hit;
   }
-  return fallback1Based - 1;
+  return -1;
+}
+
+const PAY_SPEC_ALIASES = [
+  'Номер спецификации', 'Номер Спецификации', '№ спецификации',
+  'Номер_спецификации', 'Номер спец', '№ спец',
+  'Спецификация', 'Спецификации', 'Спец', 'Спец №',
+  'Спецификация/инвойс', 'Спецификация инвойса', 'Спецификация инвойс',
+  'Номер спецификации/инвойса', 'Номер спецификации инвойса',
+  'Spec', 'Spec number', 'Spec No', 'Specification'
+];
+
+const PAY_AMOUNT_ALIASES = [
+  'Сумма', 'Сумма итого', 'Итого сумма', 'Итого', 'Итого, сумма',
+  'Сумма строки', 'Сумма позиции',
+  'Amount', 'Total', 'Sum'
+];
+
+/**
+ * Бросает читаемую ошибку с перечнем фактических заголовков листа.
+ * Зовём её, когда ни один из алиасов не нашёлся.
+ */
+function payThrowHeaderNotFound_(kindLabel, aliases, headers) {
+  const visible = headers
+    .map(function (h) { return String(h == null ? '' : h).trim(); })
+    .filter(function (s) { return s; })
+    .slice(0, 30);
+  throw new Error(
+    'Не нашёл колонку «' + kindLabel + '» на активном листе.\n' +
+    'Искал по вариантам: ' + aliases.slice(0, 6).join(', ') + ' …\n' +
+    'Фактические заголовки строки ' + PAY_CFG.HEADER_ROW + ': ' + visible.join(' | ') + '\n' +
+    'Переименуй колонку обратно в «' + aliases[0] + '» или сообщи, какое название использовать.'
+  );
 }
 
 function payManagerNameFromSheet_(sheetName) {
@@ -131,8 +188,16 @@ function payCollectSpecsFromActiveSheet_() {
   const lastRow = sheet.getLastRow();
   const headers = sheet.getRange(PAY_CFG.HEADER_ROW, 1, 1, lastCol).getValues()[0];
   const map = payHeaderMap_(headers);
-  const specCol = payFindCol_(map, ['Номер спецификации', 'Номер Спецификации'], 12);
-  const amountCol = payFindCol_(map, ['Сумма'], 15);
+  const specCol = payFindHeaderCol_(map, PAY_SPEC_ALIASES);
+  const amountCol = payFindHeaderCol_(map, PAY_AMOUNT_ALIASES);
+  if (specCol < 0) payThrowHeaderNotFound_('Номер спецификации', PAY_SPEC_ALIASES, headers);
+  if (amountCol < 0) payThrowHeaderNotFound_('Сумма', PAY_AMOUNT_ALIASES, headers);
+  if (specCol === amountCol) {
+    throw new Error(
+      'Колонки «Номер спецификации» и «Сумма» сошлись в одну — это исключено.\n' +
+      'Найденный индекс: ' + (specCol + 1) + '. Проверь заголовки строки ' + PAY_CFG.HEADER_ROW + ' активного листа.'
+    );
+  }
   const rows = lastRow >= PAY_CFG.DATA_START_ROW
     ? sheet.getRange(PAY_CFG.DATA_START_ROW, 1, lastRow - PAY_CFG.DATA_START_ROW + 1, lastCol).getValues()
     : [];
@@ -269,8 +334,16 @@ function payManagerRequestBuildDraft_(payload) {
   const lastRow = sheet.getLastRow();
   const headers = sheet.getRange(PAY_CFG.HEADER_ROW, 1, 1, lastCol).getValues()[0];
   const map = payHeaderMap_(headers);
-  const specCol = payFindCol_(map, ['Номер спецификации', 'Номер Спецификации'], 12);
-  const amountCol = payFindCol_(map, ['Сумма'], 15);
+  const specCol = payFindHeaderCol_(map, PAY_SPEC_ALIASES);
+  const amountCol = payFindHeaderCol_(map, PAY_AMOUNT_ALIASES);
+  if (specCol < 0) payThrowHeaderNotFound_('Номер спецификации', PAY_SPEC_ALIASES, headers);
+  if (amountCol < 0) payThrowHeaderNotFound_('Сумма', PAY_AMOUNT_ALIASES, headers);
+  if (specCol === amountCol) {
+    throw new Error(
+      'Колонки «Номер спецификации» и «Сумма» сошлись в одну — это исключено.\n' +
+      'Найденный индекс: ' + (specCol + 1) + '. Проверь заголовки строки ' + PAY_CFG.HEADER_ROW + ' активного листа.'
+    );
+  }
 
   const rows = sheet.getRange(PAY_CFG.DATA_START_ROW, 1, Math.max(0, lastRow - PAY_CFG.DATA_START_ROW + 1), lastCol).getValues();
   const matchedRows = [];

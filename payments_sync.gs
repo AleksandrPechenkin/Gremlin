@@ -20,16 +20,21 @@ function updateExternalPurchases() {
     const srcDisplay = srcSheet.getRange(1, 1, srcLastRow, srcLastCol).getDisplayValues();
     const hdr = srcDisplay[Math.min(1, srcDisplay.length - 1)] || []; // обычно строка 2
 
-    const canon = (s) => String(s || '').toLowerCase().replace(/ё/g, 'е').replace(/\s+/g, '');
-    const findCol = (variants, fallback0) => {
-      const cv = variants.map(canon);
-      for (let c = 0; c < hdr.length; c++) {
-        const h = canon(hdr[c]);
-        if (cv.indexOf(h) >= 0) return c;
-      }
-      return fallback0;
-    };
-    const findColOptional = (variants) => {
+    // Канон, согласованный с syncManagerCanonHeader_ (main.gs): обрабатывает №, #, точки,
+    // скобки, слэши, дефисы, подчёркивания, NBSP, ё→е. Без этого «Аванс_сумма», «№ спецификации»,
+    // «Дата.факт.Аванс» молча уходили в цифровой фолбэк, а валидатор это пропускал.
+    const canon = (s) => String(s == null ? '' : s)
+      .toLowerCase()
+      .replace(/ё/g, 'е')
+      .replace(/\u00A0/g, ' ')
+      .replace(/[№#]/g, ' ')
+      .replace(/[.,:;()/\\\[\]{}'"“”«»]/g, ' ')
+      .replace(/[-_]+/g, ' ')
+      .replace(/\s+/g, ' ')
+      .trim();
+    // Никакого цифрового фолбэка: не нашли — вернули -1, валидатор payValidateSourceSyncColumns_
+    // покажет понятное сообщение со списком отсутствующих обязательных колонок.
+    const findCol = (variants) => {
       const cv = variants.map(canon);
       for (let c = 0; c < hdr.length; c++) {
         const h = canon(hdr[c]);
@@ -37,18 +42,19 @@ function updateExternalPurchases() {
       }
       return -1;
     };
-    const srcArticleCol = findCol(['Артикул ВБ', 'Артикул WB'], 0);
+    const findColOptional = findCol;
+    const srcArticleCol = findCol(['Артикул ВБ', 'Артикул WB']);
     const srcSupplierCol = findColOptional(['Поставщик']);
-    const srcSpecCol = findCol(['Номер спецификации', 'Номер Спецификации'], 11);
-    const srcAdvSumCol = findCol(['Аванс сумма', 'Аванс, сумма'], 16);
-    const srcAdvPlanCol = findCol(['Аванс план', 'Аванс план дата', 'Дата план Аванс'], 17);
-    const srcAdvFactCol = findCol(['Аванс факт', 'Аванс факт дата', 'Дата факт Аванс'], 18);
-    const srcBalSumCol = findCol(['Баланс сумма', 'Баланс, сумма'], 19);
-    const srcBalPlanCol = findCol(['Баланс план', 'Баланс план дата', 'Дата план Баланс'], 20);
-    const srcBalFactCol = findCol(['Баланс факт', 'Баланс факт дата', 'Дата факт Баланс'], 21);
-    const srcDefSumCol = findCol(['Отсрочка сумма', 'Отсрочка, сумма'], 22);
-    const srcDefPlanCol = findCol(['Отсрочка план', 'Отсрочка план дата', 'Дата План Отсрочка'], 23);
-    const srcDefFactCol = findCol(['Отсрочка факт', 'Отсрочка факт дата', 'Дата Факт Отсрочка'], 24);
+    const srcSpecCol = findCol(['Номер спецификации', 'Номер Спецификации', '№ спецификации', 'Спецификация']);
+    const srcAdvSumCol = findCol(['Аванс сумма', 'Аванс, сумма']);
+    const srcAdvPlanCol = findCol(['Аванс план', 'Аванс план дата', 'Дата план Аванс']);
+    const srcAdvFactCol = findCol(['Аванс факт', 'Аванс факт дата', 'Дата факт Аванс']);
+    const srcBalSumCol = findCol(['Баланс сумма', 'Баланс, сумма', 'Остаток сумма', 'Остаток, сумма']);
+    const srcBalPlanCol = findCol(['Баланс план', 'Баланс план дата', 'Дата план Баланс', 'Остаток план']);
+    const srcBalFactCol = findCol(['Баланс факт', 'Баланс факт дата', 'Дата факт Баланс', 'Остаток факт']);
+    const srcDefSumCol = findCol(['Отсрочка сумма', 'Отсрочка, сумма']);
+    const srcDefPlanCol = findCol(['Отсрочка план', 'Отсрочка план дата', 'Дата План Отсрочка']);
+    const srcDefFactCol = findCol(['Отсрочка факт', 'Отсрочка факт дата', 'Дата Факт Отсрочка']);
     const srcValidationError = payValidateSourceSyncColumns_({
       headers: hdr,
       srcArticleCol: srcArticleCol,
@@ -81,17 +87,18 @@ function updateExternalPurchases() {
       return;
     }
     const destHeader = destSheet.getRange(1, 1, 1, destSheet.getLastColumn()).getDisplayValues()[0] || [];
-    const canonDest = (s) => String(s || '').toLowerCase().replace(/ё/g, 'е').replace(/\s+/g, '');
-    const findDestCol1Based = (variants, fallback1Based) => {
+    // Тот же мощный канон, что и для источника — чтобы «Номер_спецификации» / «№ спецификации»
+    // в «Закуплено» тоже находились.
+    const canonDest = canon;
+    const findDestCol1Based = (variants) => {
       const cv = variants.map(canonDest);
       for (let c = 0; c < destHeader.length; c++) {
         if (cv.indexOf(canonDest(destHeader[c])) >= 0) return c + 1;
       }
-      return fallback1Based;
+      return -1;
     };
     const destSpecCol1Based = findDestCol1Based(
-      ['Номер закупки/спецификации', 'Номер закупки', 'Номер спецификации', 'Спецификация'],
-      13
+      ['Номер закупки/спецификации', 'Номер закупки', 'Номер спецификации', '№ спецификации', 'Спецификация', 'Спецификации']
     );
     const destValidationError = payValidateDestSyncColumns_(destHeader, destSpecCol1Based);
     if (destValidationError) {
@@ -355,6 +362,8 @@ function payValidateSourceSyncColumns_(cfg) {
     ['Дата Факт Отсрочка', cfg.srcDefFactCol]
   ];
   const maxCols = h.length;
+  // findCol теперь возвращает -1 при отсутствии колонки (раньше — цифровой фолбэк,
+  // и условие `idx >= 0` всегда было истинным — валидатор пропускал даже отсутствующие шапки).
   const missing = required
     .filter(function (x) {
       const idx = x[1];
@@ -364,10 +373,16 @@ function payValidateSourceSyncColumns_(cfg) {
       return x[0];
     });
   if (!missing.length) return '';
+  const visible = h
+    .map(function (s) { return String(s == null ? '' : s).trim(); })
+    .filter(function (s) { return s; })
+    .slice(0, 30)
+    .join(' | ');
   return (
     'В активном листе не найдены обязательные колонки: ' +
     missing.join(', ') +
-    '. Проверьте заголовки во 2-й строке.'
+    '.\nФактические заголовки строки 2: ' + visible +
+    '\nПереименуйте колонки в эти варианты или сообщите, какое название использовать.'
   );
 }
 
@@ -398,10 +413,15 @@ function payValidateDestSyncColumns_(destHeader, destSpecCol1Based) {
       return x[0];
     });
   if (!missing.length) return '';
+  const visible = h
+    .map(function (s) { return String(s == null ? '' : s).trim(); })
+    .filter(function (s) { return s; })
+    .slice(0, 30)
+    .join(' | ');
   return (
     'В листе "Закуплено" не хватает обязательных колонок: ' +
     missing.join(', ') +
-    '.'
+    '.\nФактические заголовки строки 1: ' + visible
   );
 }
 

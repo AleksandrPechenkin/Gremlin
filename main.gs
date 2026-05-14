@@ -78,14 +78,9 @@ function onOpen() {
   if (typeof addSyncHubMenu_ === 'function' && isSyncHubMenuEnabled_()) {
     addSyncHubMenu_(ui);
   }
-  ui.createMenu('Планирование закупок')
-    .addItem('Подтянуть планы продаж на лист «Планирование закупок»', 'refreshProcurementPlanningFromSalesSheets')
-    .addItem('Обновить лист «Склады МС (остатки)» из МойСклад', 'syncMsStockStoresSheet')
-    .addItem('Записать учётный остаток МС на «Планирование закупок»', 'updateProcurementPlanningMsAccountingStock')
-    .addItem('Записать остаток WB на «Планирование закупок»', 'updateProcurementPlanningWbStock')
-    .addItem('Рассчитать потребность закупки (остатки + в пути + продажи)', 'computeProcurementPurchasePlan')
-    .addItem('Проверить сопоставление остатков (артикул/ШК)', 'checkProcurementPlanningStocksCoverage')
-    .addToUi();
+  // Меню «Планирование закупок» живёт в книге 03 (см. main_03.gs).
+  // В книге 01 его быть не должно: листов/свойств планирования здесь нет, и менеджеры
+  // нажимая пункты в «не той» книге, получали бы ошибки. См. README.txt и PROJECT_CONTEXT.md.
 }
 
 function syncOrdersWithMS() {

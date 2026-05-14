@@ -72,6 +72,9 @@ function addSyncHubMenu_(ui) {
         .createMenu('Операционные потоки')
         .addItem('Dry-run: Сводная 01→02 и 03', 'syncOperationalSnapshotsDryRun_')
         .addItem('Сводная 01→02 и 03 (боевой)', 'syncOperationalSnapshotsWithConfirm_')
+        .addSeparator()
+        .addItem('Dry-run: Сводная 01→03', 'syncOperationalOrdersSummaryFrom01To03DryRun_')
+        .addItem('Сводная 01→03 (боевой)', 'syncOperationalOrdersSummaryFrom01To03WithConfirm_')
     )
     .addToUi();
 }
@@ -312,6 +315,26 @@ function syncOperationalSnapshotsWithConfirm_() {
     return;
   }
   syncOperationalSnapshotsImpl_(false);
+}
+
+function syncOperationalOrdersSummaryFrom01To03DryRun_() {
+  syncOperationalOrdersSummaryFrom01To03_(true, {});
+}
+
+function syncOperationalOrdersSummaryFrom01To03WithConfirm_() {
+  const ui = SpreadsheetApp.getUi();
+  const r = ui.alert(
+    'Сводная 01→03',
+    'Скопировать лист заказной сводки из книги 01 в книгу 03?\n\n' +
+      'Проверьте, что в Script Properties книги 04 задан PROCUREMENT_SPREADSHEET_ID.\n' +
+      'Свойство ORDERS_SUMMARY_SHEET_NAME задаёт имя листа-источника (по умолчанию «Сводная»).\n\n' +
+      'Целевой лист в 03 будет полностью перезаписан значениями с 01.',
+    ui.ButtonSet.YES_NO
+  );
+  if (r !== ui.Button.YES) {
+    return;
+  }
+  syncOperationalOrdersSummaryFrom01To03_(false, {});
 }
 
 function syncOperationalSnapshotsImpl_(dryRun) {

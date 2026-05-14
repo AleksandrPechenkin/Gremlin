@@ -46,6 +46,8 @@ const PP_PROC_PLAN_HEADER_ROW = 5;
 const PP_PROC_PLAN_DATA_START_ROW = 6;
 const PP_MS_STOCK_COL_HEADER = 'Остаток МС (учётный), шт';
 const PP_WB_STOCK_COL_HEADER = 'Остаток ВБ (склады), шт';
+const PP_OZON_FBO_STOCK_COL_HEADER = 'Остаток Ozon FBO, шт';
+const PP_OZON_FBS_STOCK_COL_HEADER = 'Остаток Ozon FBS, шт';
 const PP_STOCK_CHECK_COL_HEADER = 'Проверка сопоставления (МС/WB)';
 const PP_PURCHASE_INBOUND_COL_HEADER = 'В пути до конца горизонта, шт';
 const PP_PURCHASE_ADJ_CURR_COL_HEADER = 'План тек. месяца (скорр.), шт';
@@ -189,8 +191,7 @@ function ppExtractPlansForMonthFromSupplierSkuLayout_(snap, year, month, supplie
       continue;
     }
     const rawPlan = planCol < row.length ? row[planCol] : '';
-    const qty = typeof parseNumber === 'function' ? parseNumber(rawPlan) : null;
-    const n = qty == null || isNaN(qty) ? 0 : qty;
+    const n = ppParseQtyForPlan_(rawPlan);
     out.byArticle[wbKey] = (out.byArticle[wbKey] || 0) + n;
     if (!out.displayByCanon[wbKey]) {
       out.displayByCanon[wbKey] = wbDisplayByKey[wbKey] || sku;
@@ -297,8 +298,7 @@ function ppExtractPlansForMonth_(snap, year, month) {
     const key = ppCanonArticle_(wb);
     if (!displayByCanon[key]) displayByCanon[key] = wb;
     const rawPlan = planCol < row.length ? row[planCol] : '';
-    const qty = typeof parseNumber === 'function' ? parseNumber(rawPlan) : null;
-    const n = qty == null || isNaN(qty) ? 0 : qty;
+    const n = ppParseQtyForPlan_(rawPlan);
     byArticle[key] = (byArticle[key] || 0) + n;
   }
   return { error: '', byArticle: byArticle, displayByCanon: displayByCanon, wbCol: wbCol, planCol: planCol };
@@ -415,10 +415,18 @@ function ppGetExtraSalesPlansSpreadsheetId_() {
 }
 
 function ppCanonHeaderSimple_(s) {
+  // Согласовано с syncManagerCanonHeader_ (main.gs): обрабатывает №, #, точки, скобки,
+  // слэши, кавычки, дефисы и подчёркивания. Без этого «Артикул_ВБ», «№ ВБ», «Шт./коробка»
+  // не сматчатся с «Артикул ВБ», «WB», «Шт в коробке».
+  // Дальше схлопываем пробелы И УБИРАЕМ их совсем — оставшиеся includes/indexOf-проверки
+  // в этом модуле ожидают «слитный» канон (например, `c.indexOf('заказали')`).
   return String(s == null ? '' : s)
     .toLowerCase()
-    .replace(/\u00a0/g, ' ')
+    .replace(/\u00A0/g, ' ')
     .replace(/ё/g, 'е')
+    .replace(/[№#]/g, ' ')
+    .replace(/[.,:;()/\\\[\]{}'"“”«»]/g, ' ')
+    .replace(/[-_]+/g, ' ')
     .replace(/\s+/g, '');
 }
 
@@ -426,7 +434,10 @@ function ppFindWbColInRefHeaders_(headers) {
   for (let i = 0; i < headers.length; i++) {
     if (ppIsWbArticleHeader_(headers[i])) return i;
   }
-  return 4;
+  // Раньше тут был фолбэк `4` (колонка E) — он опасен: если у листа другая структура,
+  // данные читались по неверному столбцу. Безопаснее вернуть -1 и пусть вызывающий код
+  // решает, как реагировать (обычно — сообщение пользователю про переименование шапки).
+  return -1;
 }
 
 function ppFindBarcodeColInRefHeaders_(headers) {
@@ -449,15 +460,25 @@ function ppFindSupplierArticleColInRefHeaders_(headers) {
 }
 
 function ppParsePositiveNumber_(v) {
-  if (typeof parseNumber === 'function') {
-    const n = parseNumber(v);
-    return n != null && !isNaN(n) && n > 0 ? n : 0;
-  }
-  const s = String(v == null ? '' : v)
-    .replace(/\s/g, '')
-    .replace(',', '.');
+  const n = ppParseQtyForPlan_(v);
+  return n > 0 ? n : 0;
+}
+
+/**
+ * Локальный парсер количеств для планов: не зависит от глобального parseNumber.
+ * Принимает числа, строки с пробелами/неразрывными пробелами и запятой как
+ * десятичным разделителем. Возвращает 0 при пустом/нечисловом значении.
+ *
+ * Зачем: в книге 03 может отсутствовать helpers.gs — тогда parseNumber undefined,
+ * и старая логика молча возвращала 0 для всех планов (см. диагностику от 2026-05-13).
+ */
+function ppParseQtyForPlan_(v) {
+  if (v == null || v === '') return 0;
+  if (typeof v === 'number') return isFinite(v) ? v : 0;
+  const s = String(v).replace(/\u00a0/g, '').replace(/\s/g, '').replace(',', '.');
+  if (!s) return 0;
   const n = parseFloat(s);
-  return isFinite(n) && n > 0 ? n : 0;
+  return isFinite(n) ? n : 0;
 }
 
 /**
@@ -524,6 +545,16 @@ function ppLoadProductReferenceBundle_(warnings) {
     const wbCol = ppFindWbColInRefHeaders_(headers);
     const bcCol = ppFindBarcodeColInRefHeaders_(headers);
     const saCol = ppFindSupplierArticleColInRefHeaders_(headers);
+    if (wbCol < 0) {
+      // Раньше тут был тихий фолбэк на колонку E, что приводило к «магическим»
+      // ошибкам — справочник читался по неверной колонке. Лучше явно сказать пользователю.
+      warnings.push(
+        'Справочник товаров: не нашёл колонку «Артикул ВБ». ' +
+        'Шапка строки ' + headerRow1Based + ': ' +
+        headers.map(function (h) { return String(h == null ? '' : h).trim(); }).filter(Boolean).slice(0, 20).join(' | ')
+      );
+      return empty;
+    }
     const firstDataRow = headerRow1Based + 1;
     if (firstDataRow > lastRow) {
       warnings.push('Справочник товаров: нет строк под шапкой.');
@@ -713,6 +744,575 @@ function refreshProcurementPlanningFromSalesSheets() {
     (warnings.length ? '\n\nПредупреждения:\n' + warnings.slice(0, 12).join('\n') + (warnings.length > 12 ? '\n…' : '') : '');
   SpreadsheetApp.getUi().alert(msg);
   if (typeof logInfo === 'function') logInfo('procurement_planning', { warnings: warnings, articles: sorted.length });
+}
+
+/**
+ * Конвертирует 0-based индекс колонки в A1-нотацию (0→A, 25→Z, 26→AA, …).
+ */
+function ppColToA1_(col0) {
+  let n = col0 + 1;
+  let s = '';
+  while (n > 0) {
+    const rem = (n - 1) % 26;
+    s = String.fromCharCode(65 + rem) + s;
+    n = Math.floor((n - 1) / 26);
+  }
+  return s;
+}
+
+/**
+ * Диагностический пункт меню: открывает книги-источники планов и для каждого месяца
+ * каждой вкладки показывает, какие колонки реально нашёл скрипт (anchor / WB / plan)
+ * и сколько строк дают по этой паре количество > 0.
+ *
+ * Результат пишется на лист «Планирование закупок (диагностика)» в активной книге.
+ * Сам свод плана не пересобирается — это чисто read-only отчёт.
+ */
+function diagnoseProcurementPlanningSourceSheets() {
+  const ui = SpreadsheetApp.getUi();
+  const sourceId = ppGetProp_('SALES_PLANS_SPREADSHEET_ID', PP_DEFAULT_SOURCE_SPREADSHEET_ID);
+  if (!sourceId) {
+    ui.alert('Задайте SALES_PLANS_SPREADSHEET_ID в свойствах скрипта.');
+    return;
+  }
+  const sheetNames = [
+    ppGetProp_('SALES_PLANS_SHEET_GREMLIN', PP_DEFAULT_SHEET_GREMLIN),
+    ppGetProp_('SALES_PLANS_SHEET_OBSHCHIY', PP_DEFAULT_SHEET_OBSHCHIY)
+  ];
+  const third = ppGetProp_('SALES_PLANS_SHEET_DEPT3', '');
+  if (third) sheetNames.push(third);
+
+  const { year, months } = ppParseMonthList_();
+  const monthKeys = months.map(function (m) {
+    return year + '-' + String(m).padStart(2, '0');
+  });
+
+  const out = [
+    [
+      'Книга',
+      'Вкладка',
+      'Месяц',
+      'Anchor (дата 1-го)',
+      'WB-заголовок',
+      'WB-ячейка',
+      'WB-текст',
+      'Plan-заголовок',
+      'Plan-ячейка',
+      'Plan-текст',
+      'Строк под шапкой',
+      'Из них с qty>0',
+      'Пример строки',
+      'Ошибка'
+    ]
+  ];
+
+  /**
+   * Накатывает на одну вкладку анализ ровно так же, как продукционный код,
+   * и собирает строку отчёта для каждого месяца.
+   */
+  function inspectStandardSheet_(bookLabel, sh) {
+    const snap = ppReadSheetSnapshot_(sh);
+    if (!snap.values.length) {
+      out.push([bookLabel, sh.getName(), '—', '—', '—', '—', '—', '—', '—', '—', 0, 0, '', 'Пустой лист']);
+      return;
+    }
+    const topRows = Math.min(PP_SCAN_TOP_ROWS, snap.values.length);
+    const topMatrix = [];
+    for (let r = 0; r < topRows; r++) topMatrix.push(snap.values[r]);
+    const headerEnd = Math.min(snap.values.length, PP_HEADER_SCAN_ROWS);
+    const headerMatrix = [];
+    for (let r = 0; r < headerEnd; r++) headerMatrix.push(snap.values[r]);
+    for (let mi = 0; mi < months.length; mi++) {
+      const m = months[mi];
+      const mk = monthKeys[mi];
+      const anchorCol = ppFindMonthAnchorCol_(topMatrix, year, m);
+      if (anchorCol < 0) {
+        out.push([
+          bookLabel, sh.getName(), mk, 'не найдена',
+          '—', '—', '—', '—', '—', '—', 0, 0, '',
+          'Дата 1-го числа не найдена в первых ' + PP_SCAN_TOP_ROWS + ' строках'
+        ]);
+        continue;
+      }
+      // Найдём строку, в которой стоит anchor — это нужно, чтобы показать A1-нотацию.
+      let anchorRow0 = -1;
+      for (let r = 0; r < topMatrix.length; r++) {
+        const parsed = ppParseMonthCell_(topMatrix[r][anchorCol]);
+        if (ppIsFirstOfMonth_(parsed) && parsed.y === year && parsed.m === m) {
+          anchorRow0 = r;
+          break;
+        }
+      }
+      const anchorA1 = ppColToA1_(anchorCol) + (anchorRow0 + 1);
+      const found = ppFindWbAndPlanCols_(headerMatrix, anchorCol);
+      const wbText = found.wbCol >= 0 && found.headerRow >= 0 && found.wbCol < (headerMatrix[found.headerRow] || []).length
+        ? String(headerMatrix[found.headerRow][found.wbCol] || '').trim()
+        : '';
+      const planText = found.planCol >= 0 && found.headerRow >= 0 && found.planCol < (headerMatrix[found.headerRow] || []).length
+        ? String(headerMatrix[found.headerRow][found.planCol] || '').trim()
+        : '';
+      const wbA1 = found.wbCol >= 0 ? ppColToA1_(found.wbCol) + (found.headerRow + 1) : '';
+      const planA1 = found.planCol >= 0 ? ppColToA1_(found.planCol) + (found.headerRow + 1) : '';
+      let underHeader = 0;
+      let withQty = 0;
+      let sample = '';
+      let firstAnyRow = '';
+      if (found.wbCol >= 0 && found.planCol >= 0) {
+        const dataStart = found.headerRow + 2;
+        for (let r = dataStart - 1; r < snap.values.length; r++) {
+          const row = snap.values[r];
+          const rawWb = found.wbCol < row.length ? row[found.wbCol] : '';
+          if (!ppNormArticle_(rawWb)) continue;
+          underHeader++;
+          const rawPlan = found.planCol < row.length ? row[found.planCol] : '';
+          const n = ppParseQtyForPlan_(rawPlan);
+          if (!firstAnyRow) {
+            firstAnyRow = String(rawWb).trim() + ' | raw="' + String(rawPlan) + '" | parsed=' + n;
+          }
+          if (n > 0) {
+            withQty++;
+            if (!sample) sample = String(rawWb).trim() + ' → ' + String(rawPlan).trim() + ' (=' + n + ')';
+          }
+        }
+      }
+      out.push([
+        bookLabel, sh.getName(), mk, anchorA1,
+        wbText || (found.wbCol >= 0 ? '(пусто)' : 'не найдено'),
+        wbA1, wbText,
+        planText || (found.planCol >= 0 ? '(пусто)' : 'не найдено'),
+        planA1, planText,
+        underHeader, withQty, sample || firstAnyRow, ''
+      ]);
+    }
+  }
+
+  function inspectExtraSheet_(bookLabel, sh, supplierToWb) {
+    const snap = ppReadSheetSnapshot_(sh);
+    if (!snap.values.length) {
+      out.push([bookLabel, sh.getName(), '—', '—', '—', '—', '—', '—', '—', '—', 0, 0, '', 'Пустой лист']);
+      return;
+    }
+    const topRows = Math.min(PP_SCAN_TOP_ROWS, snap.values.length);
+    const topMatrix = [];
+    for (let r = 0; r < topRows; r++) topMatrix.push(snap.values[r]);
+    const headerEnd = Math.min(snap.values.length, PP_HEADER_SCAN_ROWS);
+    const headerMatrix = [];
+    for (let r = 0; r < headerEnd; r++) headerMatrix.push(snap.values[r]);
+    for (let mi = 0; mi < months.length; mi++) {
+      const m = months[mi];
+      const mk = monthKeys[mi];
+      const anchorCol = ppFindMonthAnchorCol_(topMatrix, year, m);
+      if (anchorCol < 0) {
+        out.push([bookLabel, sh.getName(), mk, 'не найдена', '—', '—', '—', '—', '—', '—', 0, 0, '', 'Дата 1-го числа не найдена']);
+        continue;
+      }
+      let anchorRow0 = -1;
+      for (let r = 0; r < topMatrix.length; r++) {
+        const parsed = ppParseMonthCell_(topMatrix[r][anchorCol]);
+        if (ppIsFirstOfMonth_(parsed) && parsed.y === year && parsed.m === m) { anchorRow0 = r; break; }
+      }
+      const anchorA1 = ppColToA1_(anchorCol) + (anchorRow0 + 1);
+      const found = ppFindSupplierSkuAndOrderedCols_(headerMatrix, anchorCol);
+      const skuText = found.skuCol >= 0 && found.headerRow >= 0 && found.skuCol < (headerMatrix[found.headerRow] || []).length
+        ? String(headerMatrix[found.headerRow][found.skuCol] || '').trim()
+        : '';
+      const planText = found.planCol >= 0 && found.headerRow >= 0 && found.planCol < (headerMatrix[found.headerRow] || []).length
+        ? String(headerMatrix[found.headerRow][found.planCol] || '').trim()
+        : '';
+      const skuA1 = found.skuCol >= 0 ? ppColToA1_(found.skuCol) + (found.headerRow + 1) : '';
+      const planA1 = found.planCol >= 0 ? ppColToA1_(found.planCol) + (found.headerRow + 1) : '';
+      let underHeader = 0;
+      let withQty = 0;
+      let mapped = 0;
+      let sample = '';
+      let firstAnyRow = '';
+      if (found.skuCol >= 0 && found.planCol >= 0) {
+        const dataStart = found.headerRow + 2;
+        for (let r = dataStart - 1; r < snap.values.length; r++) {
+          const row = snap.values[r];
+          const rawSku = found.skuCol < row.length ? row[found.skuCol] : '';
+          if (!ppNormArticle_(rawSku)) continue;
+          underHeader++;
+          const rawPlan = found.planCol < row.length ? row[found.planCol] : '';
+          const n = ppParseQtyForPlan_(rawPlan);
+          if (!firstAnyRow) {
+            firstAnyRow = String(rawSku).trim() + ' | raw="' + String(rawPlan) + '" | parsed=' + n;
+          }
+          if (n > 0) {
+            withQty++;
+            if (!sample) sample = String(rawSku).trim() + ' → ' + String(rawPlan).trim() + ' (=' + n + ')';
+          }
+          const sk = ppCanonArticle_(String(rawSku));
+          if (sk && supplierToWb[sk]) mapped++;
+        }
+      }
+      out.push([
+        bookLabel, sh.getName(), mk, anchorA1,
+        skuText || (found.skuCol >= 0 ? '(пусто)' : 'не найдено'),
+        skuA1, skuText,
+        planText || (found.planCol >= 0 ? '(пусто)' : 'не найдено'),
+        planA1, planText,
+        underHeader, withQty, sample || firstAnyRow,
+        underHeader > 0 ? ('сопоставлено со справочником: ' + mapped + ' из ' + underHeader) : ''
+      ]);
+    }
+  }
+
+  // Основная книга планов
+  let sourceSs;
+  try {
+    sourceSs = SpreadsheetApp.openById(sourceId);
+  } catch (e) {
+    ui.alert('Не открылась основная книга планов: ' + (e.message || String(e)));
+    return;
+  }
+  const bookLabelMain = sourceSs.getName();
+  for (let si = 0; si < sheetNames.length; si++) {
+    const sh = sourceSs.getSheetByName(sheetNames[si]);
+    if (!sh) {
+      out.push([bookLabelMain, sheetNames[si], '—', '—', '—', '—', '—', '—', '—', '—', 0, 0, '', 'Вкладка не найдена']);
+      continue;
+    }
+    inspectStandardSheet_(bookLabelMain, sh);
+  }
+
+  // Доп. книга планов (Ozon-style: только «Артикул поставщика»)
+  const warningsForRef = [];
+  const refBundle = ppLoadProductReferenceBundle_(warningsForRef);
+  const extraId = ppGetExtraSalesPlansSpreadsheetId_();
+  if (extraId) {
+    try {
+      const extraSs = SpreadsheetApp.openById(extraId);
+      const extraSheetName = ppGetProp_('SALES_PLANS_EXTRA_SHEET_NAME', PP_DEFAULT_EXTRA_SOURCE_SHEET_NAME);
+      const sh = extraSs.getSheetByName(extraSheetName);
+      if (!sh) {
+        out.push([extraSs.getName(), extraSheetName, '—', '—', '—', '—', '—', '—', '—', '—', 0, 0, '', 'Вкладка не найдена']);
+      } else {
+        inspectExtraSheet_(extraSs.getName(), sh, refBundle.supplierToWb);
+      }
+    } catch (e) {
+      out.push(['(доп. книга)', '—', '—', '—', '—', '—', '—', '—', '—', '—', 0, 0, '', 'Не открылась: ' + (e.message || String(e))]);
+    }
+  }
+
+  // Записываем результат на лист в активной книге.
+  const dest = SpreadsheetApp.getActiveSpreadsheet();
+  const diagName = 'Планирование закупок (диагностика)';
+  let diag = dest.getSheetByName(diagName);
+  if (!diag) diag = dest.insertSheet(diagName);
+  diag.clearContents();
+  diag.getRange(1, 1, out.length, out[0].length).setValues(out);
+  diag.getRange(1, 1, 1, out[0].length).setFontWeight('bold');
+  try { diag.setFrozenRows(1); } catch (e) {}
+
+  let dataRows = 0;
+  let qtyRows = 0;
+  for (let i = 1; i < out.length; i++) {
+    dataRows += Number(out[i][10]) || 0;
+    qtyRows += Number(out[i][11]) || 0;
+  }
+  ui.alert(
+    'Диагностика книги планов',
+    'Записано строк отчёта: ' + (out.length - 1) +
+      '\nИтого строк под шапками: ' + dataRows +
+      '\nИз них с qty>0 в найденных plan-колонках: ' + qtyRows +
+      '\n\nЛист: «' + diagName + '».',
+    ui.ButtonSet.OK
+  );
+}
+
+/**
+ * Диагностика «Сводной» в книге 03 относительно колонки «В пути до конца горизонта, шт».
+ * Проходит по тем же правилам, что и `ppBuildInboundByMonthForPlanning_`, но не молча:
+ * собирает причины отбраковки каждой строки и кладёт отчёт на лист
+ * «Планирование закупок (диагностика Сводной)».
+ *
+ * Read-only: ничего на «Сводной» и «Планирование закупок» не правит.
+ */
+function diagnoseProcurementInboundFromSummary() {
+  const ui = SpreadsheetApp.getUi();
+  const ss = SpreadsheetApp.getActiveSpreadsheet();
+  const planName = ppGetProp_('PROCUREMENT_PLANNING_SHEET', PP_DEFAULT_OUT_SHEET);
+  const plan = ss.getSheetByName(planName);
+  if (!plan) {
+    ui.alert('Лист', 'Не найден лист «' + planName + '».', ui.ButtonSet.OK);
+    return;
+  }
+  if (plan.getLastRow() < PP_PROC_PLAN_DATA_START_ROW) {
+    ui.alert('Данные', 'На листе «' + planName + '» нет строк для диагностики.', ui.ButtonSet.OK);
+    return;
+  }
+  const planLastCol = plan.getLastColumn();
+  const planHeaders = plan.getRange(PP_PROC_PLAN_HEADER_ROW, 1, 1, planLastCol).getDisplayValues()[0];
+  const monthCols = ppPlanningFindMonthCols_(planHeaders);
+  const planCols = ppPlanningFindWbBarcodeCol0_(planHeaders);
+
+  const sv = ss.getSheetByName('Сводная');
+  const out = [];
+  const push = function () { out.push(Array.prototype.slice.call(arguments)); };
+
+  push('Параметр', 'Значение', 'Пояснение');
+  if (!sv) {
+    push('Лист «Сводная»', 'НЕ НАЙДЕН', 'Запустите «Операционные потоки → Сводная 01→03 (боевой)» в книге 04');
+    ppWriteInboundDiagSheet_(ss, out);
+    ui.alert(
+      'Диагностика «Сводной»',
+      'Лист «Сводная» в этой книге отсутствует.\n' +
+        'Запустите в книге 04: «Операционные потоки → Сводная 01→03 (боевой)».',
+      ui.ButtonSet.OK
+    );
+    return;
+  }
+  push('Лист «Сводная»', 'найден', 'строк всего: ' + sv.getLastRow() + ', колонок: ' + sv.getLastColumn());
+  push('Лист «Планирование закупок»', planName, 'строк под шапкой: ' + (plan.getLastRow() - PP_PROC_PLAN_DATA_START_ROW + 1));
+  push('Горизонт месяцев в плане', monthCols.map(function (m) { return m.key; }).join(', ') || '(не найдены)', 'колонки YYYY-MM на «' + planName + '»');
+
+  const dump = ppReadInboundRowsForPlanning_(ss);
+  push('Шапка «Сводной»', 'строка ' + dump.headerRow, 'найдена сканом первых 10 строк');
+
+  if (!dump.rows.length) {
+    push('Состояние', 'нет строк под шапкой', 'либо лист пуст, либо шапка не распознана');
+    ppWriteInboundDiagSheet_(ss, out);
+    ui.alert('Диагностика «Сводной»', 'На листе «Сводная» нет строк под шапкой.', ui.ButtonSet.OK);
+    return;
+  }
+
+  const hdr = dump.headers;
+  const idxArticle = ppPlanningFindColByHeaderVariants_(hdr, ['Артикул ВБ', 'Артикул WB']);
+  const idxBarcode = ppPlanningFindColByHeaderVariants_(hdr, ['ШК', 'Barcode']);
+  const idxQty = ppPlanningFindColByHeaderVariants_(hdr, ['Итоговое количество', 'Количество', 'Кол-во']);
+  const idxReady = ppPlanningFindColByHeaderVariants_(hdr, ['Дата готовности']);
+  const idxStatus = ppPlanningFindColByHeaderVariants_(hdr, ['Статус заказа', 'status_name', 'Статус']);
+  const idxEta = ppPlanningFindColByHeaderVariants_(hdr, ['Плановая дата поступления', 'ETA', 'Дата поступления', 'Дата прибытия']);
+  const idxPeriod = ppPlanningFindColByHeaderVariants_(hdr, ['Период (MM/YY)', 'Период']);
+
+  const colDescr = function (label, idx) {
+    if (idx < 0) return [label, 'НЕ НАЙДЕНО', '(нет такого заголовка в шапке)'];
+    const a1 = ppColToA1_(idx) + (dump.headerRow);
+    return [label, a1, hdr[idx]];
+  };
+  push.apply(null, colDescr('Артикул ВБ', idxArticle));
+  push.apply(null, colDescr('ШК', idxBarcode));
+  push.apply(null, colDescr('Итоговое количество', idxQty));
+  push.apply(null, colDescr('Статус заказа', idxStatus));
+  push.apply(null, colDescr('ETA (плановая дата поступления)', idxEta));
+  push.apply(null, colDescr('Период (MM/YY)', idxPeriod));
+  push.apply(null, colDescr('Дата готовности', idxReady));
+
+  const shippedRaw = ppGetProp_('PROCUREMENT_SHIPPED_STATUS_CODE', PP_SHIPPED_STATUS_CODE_DEFAULT);
+  const shippedCode = ppCanonArticle_(shippedRaw);
+  push('Код «отгружено»', shippedRaw, 'canon: «' + shippedCode + '» (свойство PROCUREMENT_SHIPPED_STATUS_CODE)');
+
+  if (idxArticle < 0 || idxQty < 0 || idxReady < 0 || idxStatus < 0) {
+    push('Состояние', 'отсутствуют обязательные колонки', 'нужны: Артикул ВБ, Итоговое количество, Дата готовности, Статус заказа');
+    ppWriteInboundDiagSheet_(ss, out);
+    ui.alert(
+      'Диагностика «Сводной»',
+      'В «Сводной» отсутствуют обязательные колонки.\nПодробности на листе «Планирование закупок (диагностика Сводной)».',
+      ui.ButtonSet.OK
+    );
+    return;
+  }
+
+  const wbVals = plan.getRange(PP_PROC_PLAN_DATA_START_ROW, planCols.wb + 1, plan.getLastRow() - PP_PROC_PLAN_DATA_START_ROW + 1, 1).getDisplayValues();
+  const bcVals = plan.getRange(PP_PROC_PLAN_DATA_START_ROW, planCols.bc + 1, plan.getLastRow() - PP_PROC_PLAN_DATA_START_ROW + 1, 1).getDisplayValues();
+  const need = ppPlanningNeedSetsFromWbBcColumns_(wbVals, bcVals);
+  const monthSet = {};
+  for (let i = 0; i < monthCols.length; i++) monthSet[monthCols[i].key] = true;
+
+  let total = dump.rows.length;
+  let dropQty = 0;
+  let dropMatch = 0;
+  let acceptedTotal = 0;
+  let sumAcceptedTotal = 0;
+  let acceptedTotalByArt = 0;
+  let acceptedTotalByBc = 0;
+  let noDateRows = 0;
+  let sumNoDateQty = 0;
+  let outOfHorizonRows = 0;
+  let sumOutOfHorizonQty = 0;
+  let inHorizonRows = 0;
+  let sumInHorizonQty = 0;
+  const exQty = [];
+  const exMatch = [];
+  const exDate = [];
+  const exHorizon = [];
+  const byMonth = {};
+  const byWbMonth = {};
+  const byBcMonth = {};
+  const byWbTotal = {};
+  const byBcTotal = {};
+
+  const exHeader = ['Артикул ВБ', 'ШК', 'qty (сырое)', 'Статус', 'ETA (сырое)', 'Период (сырое)', 'Дата готовности (сырое)', 'Распознанный месяц'];
+  const pickExample = function (bucket, i, monthKey) {
+    if (bucket.length >= 5) return;
+    const r = dump.rows[i];
+    const d = dump.rowsDisplay[i];
+    bucket.push([
+      String(idxArticle < r.length ? d[idxArticle] : '').trim(),
+      String(idxBarcode >= 0 && idxBarcode < r.length ? d[idxBarcode] : '').trim(),
+      String(idxQty < r.length ? d[idxQty] : '').trim(),
+      String(idxStatus < r.length ? d[idxStatus] : '').trim(),
+      String(idxEta >= 0 && idxEta < r.length ? d[idxEta] : '').trim(),
+      String(idxPeriod >= 0 && idxPeriod < r.length ? d[idxPeriod] : '').trim(),
+      String(idxReady < r.length ? d[idxReady] : '').trim(),
+      monthKey || ''
+    ]);
+  };
+
+  for (let i = 0; i < dump.rows.length; i++) {
+    const r = dump.rows[i];
+    const d = dump.rowsDisplay[i];
+    const qty = ppParseQtyForPlan_(idxQty < r.length ? r[idxQty] : '');
+    if (!(qty > 0)) { dropQty++; pickExample(exQty, i, ''); continue; }
+    const artRaw = idxArticle < r.length ? d[idxArticle] : '';
+    const bcRaw = idxBarcode >= 0 && idxBarcode < r.length ? d[idxBarcode] : '';
+    const art = ppCanonArticle_(artRaw);
+    const bc = ppCanonBarcodeForStock_(bcRaw);
+    const hitArt = !!(art && need.needWb[art]);
+    const hitBc = !!(bc && need.needBc[bc]);
+    if (!hitArt && !hitBc) { dropMatch++; pickExample(exMatch, i, ''); continue; }
+    acceptedTotal++;
+    sumAcceptedTotal += qty;
+    if (hitArt) { acceptedTotalByArt++; byWbTotal[art] = (byWbTotal[art] || 0) + qty; }
+    if (hitBc) { acceptedTotalByBc++; byBcTotal[bc] = (byBcTotal[bc] || 0) + qty; }
+
+    const st = idxStatus < r.length ? ppCanonArticle_(d[idxStatus]) : '';
+    const isShipped = st === shippedCode;
+    let arrival = null;
+    if (isShipped && idxEta >= 0 && idxEta < r.length) {
+      arrival = ppParseAnyDate_(r[idxEta]);
+      if (!arrival) arrival = ppParseAnyDate_(d[idxEta]);
+    }
+    if (!arrival) {
+      if (idxPeriod >= 0 && idxPeriod < r.length) {
+        arrival = ppMonthStartFromPeriodToken_(d[idxPeriod]);
+      }
+      if (!arrival) arrival = ppParseAnyDate_(r[idxReady]);
+      if (!arrival) arrival = ppParseAnyDate_(d[idxReady]);
+      if (arrival) arrival = new Date(arrival.getFullYear(), arrival.getMonth(), 1);
+    }
+    if (!arrival) {
+      noDateRows++;
+      sumNoDateQty += qty;
+      pickExample(exDate, i, '');
+      continue;
+    }
+    const mk = ppMonthKeyFromDate_(arrival);
+    if (!monthSet[mk]) {
+      outOfHorizonRows++;
+      sumOutOfHorizonQty += qty;
+      pickExample(exHorizon, i, mk);
+      continue;
+    }
+    inHorizonRows++;
+    sumInHorizonQty += qty;
+    if (!byMonth[mk]) byMonth[mk] = { rows: 0, qty: 0, art: 0, bc: 0 };
+    byMonth[mk].rows++;
+    byMonth[mk].qty += qty;
+    if (hitArt) { byMonth[mk].art++; const k = art + '|' + mk; byWbMonth[k] = (byWbMonth[k] || 0) + qty; }
+    if (hitBc) { byMonth[mk].bc++; const k2 = bc + '|' + mk; byBcMonth[k2] = (byBcMonth[k2] || 0) + qty; }
+  }
+
+  push('', '', '');
+  push('--- СВОДКА ПО ОБРАБОТКЕ ---', '', '');
+  push('Всего строк под шапкой', String(total), '');
+  push('Отброшено: qty<=0 или пусто', String(dropQty), 'служебные/итоговые строки');
+  push('Отброшено: не найдено в плане', String(dropMatch), 'нет совпадения по «Артикул ВБ» и по «ШК»');
+  push('Учтено в «В пути …» (всего, по плану)', String(acceptedTotal), 'сумма qty: ' + sumAcceptedTotal + ' — это значение идёт в колонку «' + PP_PURCHASE_INBOUND_COL_HEADER + '»');
+  push('  из них по «Артикул ВБ»', String(acceptedTotalByArt), '');
+  push('  из них по «ШК»', String(acceptedTotalByBc), '');
+  push('  в т.ч. без распознанной даты', String(noDateRows), 'сумма qty: ' + sumNoDateQty + ' — учтены в «итого в пути», но пока без месяца поступления');
+  push('  в т.ч. с месяцем вне горизонта плана', String(outOfHorizonRows), 'сумма qty: ' + sumOutOfHorizonQty + ' — например, 2026-04 уже отгружено, но в горизонт не входит');
+  push('  в т.ч. с месяцем в горизонте плана', String(inHorizonRows), 'сумма qty: ' + sumInHorizonQty + ' — раскладка по месяцам ниже');
+
+  push('', '', '');
+  push('--- РАЗЛОЖКА УЧТЁННЫХ ПО МЕСЯЦАМ ---', '', '');
+  push('Месяц (YYYY-MM)', 'Строк', 'Сумма qty / по «Артикул ВБ» / по «ШК»');
+  const monthKeysSorted = Object.keys(byMonth).sort();
+  for (let i = 0; i < monthKeysSorted.length; i++) {
+    const mk = monthKeysSorted[i];
+    const x = byMonth[mk];
+    push(mk, String(x.rows), x.qty + ' / ' + x.art + ' / ' + x.bc);
+  }
+
+  const writeExamples = function (title, bucket) {
+    push('', '', '');
+    push('--- ' + title + ' ---', '', '');
+    if (!bucket.length) {
+      push('(нет таких строк)', '', '');
+      return;
+    }
+    push.apply(null, exHeader);
+    for (let i = 0; i < bucket.length; i++) push.apply(null, bucket[i]);
+  };
+  writeExamples('ПРИМЕРЫ: отброшено по qty<=0', exQty);
+  writeExamples('ПРИМЕРЫ: отброшено по «нет даты»', exDate);
+  writeExamples('ПРИМЕРЫ: отброшено по «месяц вне горизонта»', exHorizon);
+  writeExamples('ПРИМЕРЫ: отброшено по «не найдено в плане»', exMatch);
+
+  let planRows = wbVals.length;
+  let coveredAny = 0;
+  let coveredByArtOnly = 0;
+  let coveredByBcOnly = 0;
+  let coveredBoth = 0;
+  let coveredNone = 0;
+  let sumCoverageQty = 0;
+  for (let i = 0; i < planRows; i++) {
+    const art = ppCanonArticle_(wbVals[i][0]);
+    const bc = ppCanonBarcodeForStock_(bcVals[i][0]);
+    const hitArt = !!(art && byWbTotal[art] > 0);
+    const hitBc = !!(bc && byBcTotal[bc] > 0);
+    let rowQty = 0;
+    if (art && byWbTotal[art] !== undefined) rowQty = byWbTotal[art];
+    else if (bc && byBcTotal[bc] !== undefined) rowQty = byBcTotal[bc];
+    sumCoverageQty += rowQty;
+    if (hitArt && hitBc) coveredBoth++;
+    else if (hitArt) coveredByArtOnly++;
+    else if (hitBc) coveredByBcOnly++;
+    else coveredNone++;
+    if (hitArt || hitBc) coveredAny++;
+  }
+  push('', '', '');
+  push('--- ПОКРЫТИЕ ПЛАНА ---', '', '');
+  push('Строк в плане', String(planRows), '');
+  push('Нашли «в пути» (всего, по плану)', String(coveredAny), 'сумма qty: ' + sumCoverageQty + ' — это попадёт в колонку «' + PP_PURCHASE_INBOUND_COL_HEADER + '»');
+  push('  только по «Артикул ВБ»', String(coveredByArtOnly), '');
+  push('  только по «ШК»', String(coveredByBcOnly), '');
+  push('  и по «Артикул ВБ», и по «ШК»', String(coveredBoth), '');
+  push('Ничего не найдено', String(coveredNone), 'эти строки получат 0 в «В пути …»');
+
+  ppWriteInboundDiagSheet_(ss, out);
+  ui.alert(
+    'Диагностика «Сводной»',
+    'Готово. Лист «Планирование закупок (диагностика Сводной)».\n' +
+      'Всего строк: ' + total + ', учтено по плану: ' + acceptedTotal + ' (qty ' + sumAcceptedTotal + ').\n' +
+      'Отброшено: qty=' + dropQty + ', не в плане=' + dropMatch + '.\n' +
+      'В т.ч. без даты: ' + noDateRows + ' (qty ' + sumNoDateQty + '), вне горизонта: ' + outOfHorizonRows + ' (qty ' + sumOutOfHorizonQty + '), в горизонте: ' + inHorizonRows + ' (qty ' + sumInHorizonQty + ').\n' +
+      'Покрыто строк плана: ' + coveredAny + ' из ' + planRows + ' (не покрыто: ' + coveredNone + ').',
+    ui.ButtonSet.OK
+  );
+}
+
+function ppWriteInboundDiagSheet_(ss, rows) {
+  const name = 'Планирование закупок (диагностика Сводной)';
+  let sh = ss.getSheetByName(name);
+  if (!sh) sh = ss.insertSheet(name);
+  sh.clearContents();
+  const width = rows.reduce(function (m, r) { return Math.max(m, r.length); }, 1);
+  const norm = rows.map(function (r) {
+    const out = r.slice();
+    while (out.length < width) out.push('');
+    return out;
+  });
+  const range = sh.getRange(1, 1, norm.length, width);
+  // Принудительно делаем формат «обычный текст», иначе Google интерпретирует значения,
+  // начинающиеся с «=», как формулу и показывает #ERROR! в заголовках секций.
+  range.setNumberFormat('@');
+  range.setValues(norm);
+  sh.getRange(1, 1, 1, width).setFontWeight('bold');
+  try { sh.setFrozenRows(1); } catch (e) {}
+  try { sh.autoResizeColumns(1, width); } catch (e) {}
 }
 
 function ppMsStoreHref_(storeId) {
@@ -928,6 +1528,55 @@ function ppPlanningFindWbStockCol0_(headers) {
   return -1;
 }
 
+function ppPlanningFindOzonFboStockCol0_(headers) {
+  const target = ppCanonHeaderSimple_(PP_OZON_FBO_STOCK_COL_HEADER);
+  for (let i = 0; i < headers.length; i++) {
+    const c = ppCanonHeaderSimple_(String(headers[i] || ''));
+    if (c === target) return i;
+    if (c.indexOf('остатокozon') >= 0 && c.indexOf('fbo') >= 0) return i;
+    if (c.indexOf('остатокозон') >= 0 && c.indexOf('fbo') >= 0) return i;
+  }
+  return -1;
+}
+
+function ppPlanningFindOzonFbsStockCol0_(headers) {
+  const target = ppCanonHeaderSimple_(PP_OZON_FBS_STOCK_COL_HEADER);
+  for (let i = 0; i < headers.length; i++) {
+    const c = ppCanonHeaderSimple_(String(headers[i] || ''));
+    if (c === target) return i;
+    if (c.indexOf('остатокozon') >= 0 && c.indexOf('fbs') >= 0) return i;
+    if (c.indexOf('остатокозон') >= 0 && c.indexOf('fbs') >= 0) return i;
+  }
+  return -1;
+}
+
+function ppPlanningFindSupplierArticleCol0_(headers) {
+  for (let i = 0; i < headers.length; i++) {
+    const raw = String(headers[i] || '');
+    if (ppIsSupplierSkuColumnHeader_(raw)) return i;
+  }
+  return ppPlanningFindColByHeaderVariants_(headers, ['Артикул поставщика', 'Наименование']);
+}
+
+/** Набор canon(«Артикул поставщика») для строк плана. Используется в матчинге Ozon. */
+function ppPlanningNeedSupplierSet_(supplierVals) {
+  const need = {};
+  for (let i = 0; i < supplierVals.length; i++) {
+    const s = ppCanonArticle_(supplierVals[i][0]);
+    if (s) need[s] = true;
+  }
+  return need;
+}
+
+/** Универсальный lookup по (артикул поставщика, ШК) — для Ozon-карт остатков и продаж. */
+function ppLookupBySupplierBarcode_(supplierCell, bcCell, bySupplier, byBarcode) {
+  const sa = ppCanonArticle_(supplierCell);
+  if (sa && bySupplier && bySupplier[sa] !== undefined) return bySupplier[sa];
+  const bc = ppCanonBarcodeForStock_(bcCell);
+  if (bc && byBarcode && byBarcode[bc] !== undefined) return byBarcode[bc];
+  return 0;
+}
+
 function ppPlanningFindStockCheckCol0_(headers) {
   const target = ppCanonHeaderSimple_(PP_STOCK_CHECK_COL_HEADER);
   for (let i = 0; i < headers.length; i++) {
@@ -939,13 +1588,18 @@ function ppPlanningFindStockCheckCol0_(headers) {
 }
 
 function ppPlanningFindColByHeaderVariants_(headers, variants) {
-  const canonVariants = variants.map(function (v) {
-    return ppCanonHeaderSimple_(v);
-  });
+  // ВАЖНО: ищем в порядке вариантов. Сначала первый вариант — по всей шапке;
+  // только если не нашли — пробуем второй и т.д. Это нужно, например, чтобы
+  // для idxQty взять «Итоговое количество» (G в «Сводной»), а не «Количество» (D),
+  // — обе колонки есть в шапке, и при цикле «по колонкам сначала» брался ошибочный.
+  const canonHeaders = [];
   for (let i = 0; i < headers.length; i++) {
-    const c = ppCanonHeaderSimple_(String(headers[i] || ''));
-    for (let j = 0; j < canonVariants.length; j++) {
-      if (c === canonVariants[j]) return i;
+    canonHeaders.push(ppCanonHeaderSimple_(String(headers[i] || '')));
+  }
+  for (let j = 0; j < variants.length; j++) {
+    const v = ppCanonHeaderSimple_(variants[j]);
+    for (let i = 0; i < canonHeaders.length; i++) {
+      if (canonHeaders[i] === v) return i;
     }
   }
   return -1;
@@ -1005,15 +1659,17 @@ function ppMonthFirstDateFromKey_(k) {
 }
 
 function ppToNumOr0_(v) {
-  const n = typeof parseNumber === 'function' ? parseNumber(v) : null;
-  return n == null || !isFinite(n) ? 0 : n;
+  return ppParseQtyForPlan_(v);
 }
 
 function ppReadInboundRowsForPlanning_(ss) {
   const sh = ss.getSheetByName('Сводная');
   if (!sh || sh.getLastRow() < 2) return { rows: [], headerRow: 1 };
   const lastCol = sh.getLastColumn();
-  const maxScan = Math.min(sh.getLastRow(), 5);
+  // Сводная в книге 03 — это снимок из 01. Иногда сверху появляются служебные
+  // строки (заголовок «Сводная», описание, разделители). Сканируем первые 10
+  // строк в поисках реальной шапки с «Артикул ВБ».
+  const maxScan = Math.min(sh.getLastRow(), 10);
   let headerRow = 1;
   for (let r = 1; r <= maxScan; r++) {
     const hdr = sh.getRange(r, 1, 1, lastCol).getDisplayValues()[0];
@@ -1032,8 +1688,11 @@ function ppReadInboundRowsForPlanning_(ss) {
 }
 
 function ppBuildInboundByMonthForPlanning_(ss, monthKeys, needWb, needBc) {
+  const empty = { byWbMonth: {}, byBcMonth: {}, byWbTotal: {}, byBcTotal: {}, errors: [], usedRows: 0, totalRows: 0 };
   const dump = ppReadInboundRowsForPlanning_(ss);
-  if (!dump.rows.length) return { byWbMonth: {}, byBcMonth: {}, errors: ['Лист «Сводная» пуст или не найден.'], usedRows: 0 };
+  if (!dump.rows.length) {
+    return Object.assign({}, empty, { errors: ['Лист «Сводная» пуст или не найден.'] });
+  }
   const hdr = dump.headers;
   const idxArticle = ppPlanningFindColByHeaderVariants_(hdr, ['Артикул ВБ', 'Артикул WB']);
   const idxBarcode = ppPlanningFindColByHeaderVariants_(hdr, ['ШК', 'Barcode']);
@@ -1043,15 +1702,23 @@ function ppBuildInboundByMonthForPlanning_(ss, monthKeys, needWb, needBc) {
   const idxEta = ppPlanningFindColByHeaderVariants_(hdr, ['Плановая дата поступления', 'ETA', 'Дата поступления', 'Дата прибытия']);
   const idxPeriod = ppPlanningFindColByHeaderVariants_(hdr, ['Период (MM/YY)', 'Период']);
   if (idxArticle < 0 || idxQty < 0 || idxReady < 0 || idxStatus < 0) {
-    return { byWbMonth: {}, byBcMonth: {}, errors: ['В «Сводная» не найдены обязательные колонки для in-transit.'], usedRows: 0 };
+    return Object.assign({}, empty, { errors: ['В «Сводная» не найдены обязательные колонки для in-transit.'] });
   }
 
   const monthSet = {};
   for (let i = 0; i < monthKeys.length; i++) monthSet[monthKeys[i]] = true;
+  // По месяцам (для будущего пересчёта остатков с учётом даты прихода).
   const byWbMonth = {};
   const byBcMonth = {};
+  // Итого без оглядки на дату/горизонт: всё, что qty>0 и есть в плане.
+  // Это значение идёт в колонку «В пути до конца горизонта, шт» на листе планирования —
+  // пользователь хочет видеть «полное в пути» сейчас, а планирование по датам поступления
+  // (раскладка по месяцам) появится на следующем этапе.
+  const byWbTotal = {};
+  const byBcTotal = {};
   const shippedCode = ppCanonArticle_(ppGetProp_('PROCUREMENT_SHIPPED_STATUS_CODE', PP_SHIPPED_STATUS_CODE_DEFAULT));
   let usedRows = 0;
+  let totalRows = 0;
 
   for (let i = 0; i < dump.rows.length; i++) {
     const r = dump.rows[i];
@@ -1062,7 +1729,14 @@ function ppBuildInboundByMonthForPlanning_(ss, monthKeys, needWb, needBc) {
     if (!(qty > 0)) continue;
     const art = ppCanonArticle_(artRaw);
     const bc = ppCanonBarcodeForStock_(bcRaw);
-    if (!(art && needWb[art]) && !(bc && needBc[bc])) continue;
+    const hitArt = !!(art && needWb[art]);
+    const hitBc = !!(bc && needBc[bc]);
+    if (!hitArt && !hitBc) continue;
+    // Итого «в пути» по плану — независимо от даты.
+    if (hitArt) byWbTotal[art] = (byWbTotal[art] || 0) + qty;
+    if (hitBc) byBcTotal[bc] = (byBcTotal[bc] || 0) + qty;
+    totalRows++;
+
     const st = idxStatus < r.length ? ppCanonArticle_(d[idxStatus]) : '';
     const isShipped = st === shippedCode;
     let arrival = null;
@@ -1081,17 +1755,25 @@ function ppBuildInboundByMonthForPlanning_(ss, monthKeys, needWb, needBc) {
     if (!arrival) continue;
     const mk = ppMonthKeyFromDate_(arrival);
     if (!monthSet[mk]) continue;
-    if (art && needWb[art]) {
+    if (hitArt) {
       const k = art + '|' + mk;
       byWbMonth[k] = (byWbMonth[k] || 0) + qty;
     }
-    if (bc && needBc[bc]) {
+    if (hitBc) {
       const k2 = bc + '|' + mk;
       byBcMonth[k2] = (byBcMonth[k2] || 0) + qty;
     }
     usedRows++;
   }
-  return { byWbMonth: byWbMonth, byBcMonth: byBcMonth, errors: [], usedRows: usedRows };
+  return {
+    byWbMonth: byWbMonth,
+    byBcMonth: byBcMonth,
+    byWbTotal: byWbTotal,
+    byBcTotal: byBcTotal,
+    errors: [],
+    usedRows: usedRows,
+    totalRows: totalRows
+  };
 }
 
 function ppLookupByRowKey_(wbCell, bcCell, byWb, byBc) {
@@ -1328,6 +2010,140 @@ function updateProcurementPlanningWbStock() {
 }
 
 /**
+ * Заполняет на листе «Планирование закупок» колонки «Остаток Ozon FBO, шт» и «Остаток Ozon FBS, шт».
+ *
+ * Сопоставление: offer_id ↔ canon(«Артикул поставщика»), barcode ↔ canon(«ШК»).
+ * Если колонок Ozon ещё нет — создаются в конце шапки. Если в плане нет колонки
+ * «Артикул поставщика», матчинг идёт только по ШК (что соответствует ограниченному
+ * покрытию — пользователь увидит это в финальном сообщении: «без supplier-колонки»).
+ */
+function updateProcurementPlanningOzonStock() {
+  const ui = SpreadsheetApp.getUi();
+  if (!ozGetProp_('OZON_API_TOKEN', '')) {
+    ui.alert(
+      'Настройка',
+      'Нужен OZON_API_TOKEN в свойствах скрипта.\n' +
+        'Формат: «<Client-Id>:<Api-Key>» (значения из ЛК Ozon → Настройки → Seller API).',
+      ui.ButtonSet.OK
+    );
+    return;
+  }
+
+  const ss = SpreadsheetApp.getActiveSpreadsheet();
+  const planName = ppGetProp_('PROCUREMENT_PLANNING_SHEET', PP_DEFAULT_OUT_SHEET);
+  const plan = ss.getSheetByName(planName);
+  if (!plan) {
+    ui.alert('Лист', 'Не найден лист «' + planName + '».', ui.ButtonSet.OK);
+    return;
+  }
+  if (plan.getLastRow() < PP_PROC_PLAN_DATA_START_ROW) {
+    ui.alert('Данные', 'На листе «' + planName + '» нет строк таблицы (ожидается шапка в строке ' + PP_PROC_PLAN_HEADER_ROW + ').', ui.ButtonSet.OK);
+    return;
+  }
+
+  const lastCol = plan.getLastColumn();
+  const hdr = plan.getRange(PP_PROC_PLAN_HEADER_ROW, 1, 1, lastCol).getValues()[0];
+  const cols = ppPlanningFindWbBarcodeCol0_(hdr);
+  const supplierCol0 = ppPlanningFindSupplierArticleCol0_(hdr);
+
+  let fboCol0 = ppPlanningFindOzonFboStockCol0_(hdr);
+  if (fboCol0 < 0) {
+    fboCol0 = hdr.length;
+    plan.getRange(PP_PROC_PLAN_HEADER_ROW, fboCol0 + 1).setValue(PP_OZON_FBO_STOCK_COL_HEADER).setFontWeight('bold');
+  }
+  const hdr2 = plan.getRange(PP_PROC_PLAN_HEADER_ROW, 1, 1, plan.getLastColumn()).getValues()[0];
+  let fbsCol0 = ppPlanningFindOzonFbsStockCol0_(hdr2);
+  if (fbsCol0 < 0) {
+    fbsCol0 = hdr2.length;
+    plan.getRange(PP_PROC_PLAN_HEADER_ROW, fbsCol0 + 1).setValue(PP_OZON_FBS_STOCK_COL_HEADER).setFontWeight('bold');
+  }
+
+  const lastRow = plan.getLastRow();
+  const numRows = lastRow - PP_PROC_PLAN_DATA_START_ROW + 1;
+  const bcVals = plan.getRange(PP_PROC_PLAN_DATA_START_ROW, cols.bc + 1, numRows, 1).getDisplayValues();
+  const supplierVals = supplierCol0 >= 0
+    ? plan.getRange(PP_PROC_PLAN_DATA_START_ROW, supplierCol0 + 1, numRows, 1).getDisplayValues()
+    : [];
+  const needSupplier = supplierVals.length ? ppPlanningNeedSupplierSet_(supplierVals) : {};
+  const needBc = {};
+  for (let i = 0; i < bcVals.length; i++) {
+    const b = ppCanonBarcodeForStock_(bcVals[i][0]);
+    if (b) needBc[b] = true;
+  }
+  const needSupplierCount = Object.keys(needSupplier).length;
+  const needBcCount = Object.keys(needBc).length;
+  if (!needSupplierCount && !needBcCount) {
+    ui.alert(
+      'Планирование',
+      'В колонках «Артикул поставщика» и «ШК» нет ни одного заполненного значения — нечего сопоставлять с Ozon.',
+      ui.ButtonSet.OK
+    );
+    return;
+  }
+
+  let lookup;
+  try {
+    lookup = ozBuildStockLookupForProcurementPlanning_(needSupplier, needBc);
+  } catch (e) {
+    ui.alert('Ozon', 'Ошибка при получении остатков:\n' + (e.message || String(e)), ui.ButtonSet.OK);
+    return;
+  }
+
+  const outFbo = [];
+  const outFbs = [];
+  let filledFbo = 0;
+  let filledFbs = 0;
+  for (let i = 0; i < numRows; i++) {
+    const supCell = supplierVals.length ? supplierVals[i][0] : '';
+    const bcCell = bcVals[i][0];
+    const qFbo = ppLookupBySupplierBarcode_(supCell, bcCell, lookup.stockBySupplierFbo, lookup.stockByBarcodeFbo);
+    const qFbs = ppLookupBySupplierBarcode_(supCell, bcCell, lookup.stockBySupplierFbs, lookup.stockByBarcodeFbs);
+    if (qFbo) filledFbo++;
+    if (qFbs) filledFbs++;
+    outFbo.push([qFbo || '']);
+    outFbs.push([qFbs || '']);
+  }
+  plan.getRange(PP_PROC_PLAN_DATA_START_ROW, fboCol0 + 1, numRows, 1).setValues(outFbo).setNumberFormat('0');
+  plan.getRange(PP_PROC_PLAN_DATA_START_ROW, fbsCol0 + 1, numRows, 1).setValues(outFbs).setNumberFormat('0');
+
+  ui.alert(
+    'Готово',
+    'Источник: ' +
+      (lookup.source || 'Ozon Seller API') +
+      '\nТоваров в /v3/product/info/stocks: ' +
+      lookup.stats.itemsFromStocks +
+      '\nСовпадений по «Артикул поставщика»: ' +
+      lookup.stats.offerHits +
+      (supplierCol0 < 0 ? ' (колонка «Артикул поставщика» не найдена — матчинг только по ШК)' : '') +
+      '\nСовпадений по ШК: ' +
+      lookup.stats.barcodeHits +
+      '\nСтрок таблицы: ' +
+      numRows +
+      ', с FBO≠0: ' +
+      filledFbo +
+      ', с FBS≠0: ' +
+      filledFbs +
+      '\n\nКолонки: «' +
+      PP_OZON_FBO_STOCK_COL_HEADER +
+      '», «' +
+      PP_OZON_FBS_STOCK_COL_HEADER +
+      '».',
+    ui.ButtonSet.OK
+  );
+  if (typeof logInfo === 'function') {
+    logInfo('updateProcurementPlanningOzonStock', {
+      source: lookup.source,
+      rows: numRows,
+      filledFbo: filledFbo,
+      filledFbs: filledFbs,
+      needSupplier: needSupplierCount,
+      needBc: needBcCount,
+      stats: lookup.stats
+    });
+  }
+}
+
+/**
  * Динамический расчёт потребности закупки на горизонте месячных колонок листа планирования.
  * Формула: stock_t = stock_{t-1} + inbound_t - salesAdjusted_t.
  */
@@ -1389,8 +2205,21 @@ function computeProcurementPurchasePlan() {
     nameCol0 >= 0
       ? plan.getRange(PP_PROC_PLAN_DATA_START_ROW, nameCol0 + 1, numRows, 1).getDisplayValues()
       : [];
+  const supplierCol0Compute = ppPlanningFindSupplierArticleCol0_(headers);
+  const supplierValsForOzon = supplierCol0Compute >= 0
+    ? plan.getRange(PP_PROC_PLAN_DATA_START_ROW, supplierCol0Compute + 1, numRows, 1).getDisplayValues()
+    : nameVals;
   const msVals = plan.getRange(PP_PROC_PLAN_DATA_START_ROW, msCol0 + 1, numRows, 1).getValues();
   const wbStockVals = plan.getRange(PP_PROC_PLAN_DATA_START_ROW, wbCol0 + 1, numRows, 1).getValues();
+  // Колонки Ozon — необязательные. Если их нет, считаем что вклад в stockStart нулевой.
+  const ozFboCol0 = ppPlanningFindOzonFboStockCol0_(headers);
+  const ozFbsCol0 = ppPlanningFindOzonFbsStockCol0_(headers);
+  const ozFboVals = ozFboCol0 >= 0
+    ? plan.getRange(PP_PROC_PLAN_DATA_START_ROW, ozFboCol0 + 1, numRows, 1).getValues()
+    : [];
+  const ozFbsVals = ozFbsCol0 >= 0
+    ? plan.getRange(PP_PROC_PLAN_DATA_START_ROW, ozFbsCol0 + 1, numRows, 1).getValues()
+    : [];
   const monthVals = plan.getRange(PP_PROC_PLAN_DATA_START_ROW, monthCols[0].col0 + 1, numRows, monthCols.length).getValues();
 
   const need = ppPlanningNeedSetsFromWbBcColumns_(wbVals, bcVals);
@@ -1402,6 +2231,21 @@ function computeProcurementPurchasePlan() {
     salesFact = wbFetchCurrentMonthSalesForPlanning_(need.needWb, need.needBc);
   } catch (e) {
     salesErr = e && e.message ? e.message : String(e);
+  }
+
+  // Продажи Ozon (опционально): тянем только если есть токен и хотя бы одна supplier-строка,
+  // иначе сразу пустой результат — расчёт работает как раньше, без Ozon.
+  const needSupplier = supplierValsForOzon.length ? ppPlanningNeedSupplierSet_(supplierValsForOzon) : {};
+  const needBcForOzon = need.needBc;
+  let ozSalesFact = { bySupplier: {}, byBarcode: {}, rows: 0 };
+  let ozSalesErr = '';
+  const ozTokenPresent = !!(typeof ozGetProp_ === 'function' && ozGetProp_('OZON_API_TOKEN', ''));
+  if (ozTokenPresent && typeof ozFetchCurrentMonthSalesForPlanning_ === 'function' && Object.keys(needSupplier).length) {
+    try {
+      ozSalesFact = ozFetchCurrentMonthSalesForPlanning_(needSupplier, needBcForOzon);
+    } catch (e) {
+      ozSalesErr = e && e.message ? e.message : String(e);
+    }
   }
 
   const currentMonthDate = new Date();
@@ -1425,8 +2269,11 @@ function computeProcurementPurchasePlan() {
     'Артикул поставщика (название)',
     'Остаток МС, шт',
     'Остаток ВБ, шт',
+    PP_OZON_FBO_STOCK_COL_HEADER,
+    PP_OZON_FBS_STOCK_COL_HEADER,
     'Стартовый остаток, шт',
     'Продажи WB тек. месяца, шт',
+    'Продажи Ozon тек. месяца, шт',
     PP_PURCHASE_ADJ_CURR_COL_HEADER,
     PP_PURCHASE_INBOUND_COL_HEADER,
     PP_PURCHASE_DEFICIT_COL_HEADER,
@@ -1451,8 +2298,13 @@ function computeProcurementPurchasePlan() {
     const wbCell = wbVals[r][0];
     const bcCell = bcVals[r][0];
     const supplierName = nameVals.length ? nameVals[r][0] : '';
-    const stockStart = ppToNumOr0_(msVals[r][0]) + ppToNumOr0_(wbStockVals[r][0]);
-    const soldCurrent = ppLookupByRowKey_(wbCell, bcCell, salesFact.byWb, salesFact.byBarcode);
+    const supplierForOzon = supplierValsForOzon.length ? supplierValsForOzon[r][0] : '';
+    const ozFboQty = ozFboVals.length ? ppToNumOr0_(ozFboVals[r][0]) : 0;
+    const ozFbsQty = ozFbsVals.length ? ppToNumOr0_(ozFbsVals[r][0]) : 0;
+    const stockStart = ppToNumOr0_(msVals[r][0]) + ppToNumOr0_(wbStockVals[r][0]) + ozFboQty + ozFbsQty;
+    const soldCurrentWb = ppLookupByRowKey_(wbCell, bcCell, salesFact.byWb, salesFact.byBarcode);
+    const soldCurrentOzon = ppLookupBySupplierBarcode_(supplierForOzon, bcCell, ozSalesFact.bySupplier, ozSalesFact.byBarcode);
+    const soldCurrent = soldCurrentWb + soldCurrentOzon;
     let adjustedCurrent = '';
     let runStock = stockStart;
     let minStock = stockStart;
@@ -1471,6 +2323,7 @@ function computeProcurementPurchasePlan() {
       runStock = startMonth;
       let planQty = ppToNumOr0_(monthVals[r][m]);
       if (m === currentMonthIndex) {
+        // Скорректированный план текущего месяца = план − факт WB − факт Ozon.
         planQty = Math.max(0, planQty - soldCurrent);
         adjustedCurrent = planQty;
       }
@@ -1503,7 +2356,12 @@ function computeProcurementPurchasePlan() {
     if (needAtStartTarget > 0) positiveNeedStart++;
     if (needAtEndTarget > 0) positiveNeedEnd++;
     if (needAtStartTarget !== needAtEndTarget) splitDiffRows++;
-    outInbound.push([sumInbound || '']);
+    // В колонку «В пути до конца горизонта, шт» пишем полное «итого в пути»
+    // (qty>0 + есть в плане), независимо от того, удалось ли распознать дату.
+    // Это видимость для пользователя «сколько всего едет». Помесячная разнёска
+    // по датам поступления — следующий этап (планирование товаров в пути по датам).
+    const totalInbound = ppLookupByRowKey_(wbCell, bcCell, inbound.byWbTotal, inbound.byBcTotal);
+    outInbound.push([totalInbound || '']);
     outAdj.push([adjustedCurrent === '' ? '' : adjustedCurrent]);
     outDeficit.push([deficit || '']);
     outReco.push([reco || '']);
@@ -1519,8 +2377,11 @@ function computeProcurementPurchasePlan() {
         supplierName,
         ppToNumOr0_(msVals[r][0]),
         ppToNumOr0_(wbStockVals[r][0]),
+        ozFboQty,
+        ozFbsQty,
         stockStart,
-        soldCurrent,
+        soldCurrentWb,
+        soldCurrentOzon,
         adjustedCurrent === '' ? 0 : adjustedCurrent,
         sumInbound,
         deficit,
@@ -1566,6 +2427,8 @@ function computeProcurementPurchasePlan() {
   const warn = [];
   if (inbound.errors.length) warn.push('В пути: ' + inbound.errors.join('; '));
   if (salesErr) warn.push('WB продажи: ' + salesErr);
+  if (ozSalesErr) warn.push('Ozon продажи: ' + ozSalesErr);
+  const ozonStockColsPresent = ozFboCol0 >= 0 || ozFbsCol0 >= 0;
   ui.alert(
     'Потребность закупки',
     'Строк: ' +
@@ -1588,9 +2451,20 @@ function computeProcurementPurchasePlan() {
       splitDiffRows +
       ' SKU' +
       '\nВ пути учтено строк: ' +
-      inbound.usedRows +
+      (inbound.totalRows || inbound.usedRows) +
+      ' (по плану всего; в т.ч. с распознанной датой в горизонте: ' + inbound.usedRows + ')' +
       '\nWB продаж обработано строк: ' +
       salesFact.rows +
+      (salesFact.source || salesFact.metric
+        ? ' (' +
+          [salesFact.source, salesFact.metric].filter(function (x) { return x; }).join('/') +
+          (salesFact.fromCache ? ', из кеша' : '') +
+          ')'
+        : salesFact.fromCache ? ' (из кеша)' : '') +
+      (salesFact.skipped ? ' (пропущено WB_SALES_SKIP)' : '') +
+      '\nOzon: остатки в stockStart — ' + (ozonStockColsPresent ? 'учтены (FBO+FBS из листа)' : 'нет колонок на листе') +
+      '; продажи тек. месяца обработано posting: ' + (ozSalesFact.rows || 0) +
+      (ozTokenPresent ? '' : ' (OZON_API_TOKEN не задан)') +
       '\nЛист детализации: «' +
       reportSheetName +
       '»' +
@@ -1608,6 +2482,13 @@ function computeProcurementPurchasePlan() {
       splitDiffRows: splitDiffRows,
       inboundRows: inbound.usedRows,
       wbSalesRows: salesFact.rows,
+      wbSalesSource: salesFact.source || null,
+      wbSalesMetric: salesFact.metric || null,
+      wbSalesFromCache: !!salesFact.fromCache,
+      wbSalesSkipped: !!salesFact.skipped,
+      ozonStockColsPresent: ozonStockColsPresent,
+      ozonSalesRows: ozSalesFact.rows || 0,
+      ozonTokenPresent: ozTokenPresent,
       warnings: warn
     });
   }

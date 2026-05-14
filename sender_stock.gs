@@ -337,6 +337,17 @@ function findHeaderStock_(map, names, fallback1Based) {
     const key = canonStock_(names[i]);
     if (map[key] != null) return map[key];
   }
+  // Не нашли ни один вариант — используем фолбэк, но громко пишем в лог,
+  // чтобы при тихих расхождениях («Номер_спецификации» вместо «Номер спецификации»)
+  // было видно по Apps Script Logs / Stackdriver, что данные считаются по индексу.
+  // Если в production это причинит вред — заменить на throw new Error(...).
+  Logger.log(
+    '[STOCK][WARN] Колонка не найдена по имени, используется фолбэк %s. Искали: %s. ' +
+    'Доступные ключи карты: %s',
+    fallback1Based,
+    names.join(', '),
+    Object.keys(map).slice(0, 40).join(' | ')
+  );
   return fallback1Based - 1;
 }
 
@@ -350,11 +361,16 @@ function findHeaderIdxOptional_(map, names) {
 }
 
 function canonStock_(v) {
-  return String(v || '')
+  return String(v == null ? '' : v)
     .toLowerCase()
     .replace(/\u00a0/g, ' ')
     .replace(/ё/g, 'е')
-    .replace(/[.,;:!?()[\]{}"']/g, ' ')
+    .replace(/[№#]/g, ' ')
+    // Точки, запятые, скобки, слэши, кавычки и угловые кавычки → пробел.
+    .replace(/[.,;:!?()/\\\[\]{}"'“”«»]/g, ' ')
+    // Дефисы и подчёркивания тоже к пробелам, чтобы «Отгрузка_через» /
+    // «Отгрузка-через» сводились к каноническому «отгрузка через».
+    .replace(/[-_]+/g, ' ')
     .replace(/\s+/g, ' ')
     .trim();
 }
