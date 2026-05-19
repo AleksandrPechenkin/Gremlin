@@ -1,50 +1,118 @@
-# [PROJECT_NAME] Constitution
-<!-- Example: Spec Constitution, TaskFlow Constitution, etc. -->
+<!--
+Sync Impact Report
+Version: (template) → 1.0.0
+Modified principles: initial adoption (no prior version)
+Added sections: Core Principles (7), Technology & Platform, Development Workflow, Governance
+Removed sections: none
+Templates: plan-template.md ✅ aligned (Constitution Check references this file)
+           spec-template.md ✅ no change required
+           tasks-template.md ✅ no change required
+Deferred: none
+-->
+
+# Gremlin Constitution
 
 ## Core Principles
 
-### [PRINCIPLE_1_NAME]
-<!-- Example: I. Library-First -->
-[PRINCIPLE_1_DESCRIPTION]
-<!-- Example: Every feature starts as a standalone library; Libraries must be self-contained, independently testable, documented; Clear purpose required - no organizational-only libraries -->
+### I. Таблицы — операционная среда
 
-### [PRINCIPLE_2_NAME]
-<!-- Example: II. CLI Interface -->
-[PRINCIPLE_2_DESCRIPTION]
-<!-- Example: Every library exposes functionality via CLI; Text in/out protocol: stdin/args → stdout, errors → stderr; Support JSON + human-readable formats -->
+Google Таблицы — основная среда ежедневной работы менеджеров и аналитики (заказы,
+сводки, планирование, реестры). Новые процессы MUST проектироваться так, чтобы
+операционная работа оставалась в таблицах, если нет веской причины иного.
 
-### [PRINCIPLE_3_NAME]
-<!-- Example: III. Test-First (NON-NEGOTIABLE) -->
-[PRINCIPLE_3_DESCRIPTION]
-<!-- Example: TDD mandatory: Tests written → User approved → Tests fail → Then implement; Red-Green-Refactor cycle strictly enforced -->
+**Rationale**: гибкость и привычный UX для команды важнее ранней нормализации в ERP.
 
-### [PRINCIPLE_4_NAME]
-<!-- Example: IV. Integration Testing -->
-[PRINCIPLE_4_DESCRIPTION]
-<!-- Example: Focus areas requiring integration tests: New library contract tests, Contract changes, Inter-service communication, Shared schemas -->
+### II. МойСклад — осознанная синхронизация
 
-### [PRINCIPLE_5_NAME]
-<!-- Example: V. Observability, VI. Versioning & Breaking Changes, VII. Simplicity -->
-[PRINCIPLE_5_DESCRIPTION]
-<!-- Example: Text I/O ensures debuggability; Structured logging required; Or: MAJOR.MINOR.BUILD format; Or: Start simple, YAGNI principles -->
+«МойСклад» — хранилище нормализованной информации (остатки, документы, справочники
+там, где оправдано API). Перенос в МС MUST быть явно согласован: что, когда и в каком
+виде уходит. MUST NOT подменять таблицы МойСкладом (и наоборот) без обоснования.
 
-## [SECTION_2_NAME]
-<!-- Example: Additional Constraints, Security Requirements, Performance Standards, etc. -->
+**Rationale**: разные источники правды для разных этапов процесса.
 
-[SECTION_2_CONTENT]
-<!-- Example: Technology stack requirements, compliance standards, deployment policies, etc. -->
+### III. Источник правды по этапу процесса
 
-## [SECTION_3_NAME]
-<!-- Example: Development Workflow, Review Process, Quality Gates, etc. -->
+Перед реализацией MUST быть ясен источник правды для шага (лист/книга/МС).
+Примеры зафиксированных правил: «Сводная» (01) для операционных позиций отгрузки;
+«Партии_в_рейсе» (05) — производная для себестоимости; связь через `Рейс`
+(`SHIPMENT_ID`, формат `TR-YYYY-NNNN`). Ручной ввод в производные листы, которые
+пересобираются автоматически, MUST быть запрещён или явно помечен.
 
-[SECTION_3_CONTENT]
-<!-- Example: Code review requirements, testing gates, deployment approval process, etc. -->
+**Rationale**: предотвращает потерю данных при пересборке и расхождения между книгами.
+
+### IV. Минимальный дифф и стиль репозитория
+
+Изменения кода MUST быть минимальными, в стиле существующих `.gs` файлов, без
+несвязанных рефакторингов. Новые markdown-файлы MUST NOT создаваться без явной просьбы
+владельца (артефакты Spec Kit в `specs/` — исключение).
+
+**Rationale**: репозиторий деплоится вручную в несколько GAS-проектов; лишний шум
+усложняет перенос.
+
+### V. Деплой Google Apps Script
+
+Код переносится в GAS **целиком**: файл из папки проекта → полная замена в редакторе
+скриптов соответствующей книги → сохранение. MUST NOT собирать модули из фрагментов
+чата. Каждая книга (01–05) — отдельный GAS-проект с согласованным набором файлов
+(см. `README.txt`).
+
+**Rationale**: один `onOpen` на книгу, разные Script Properties и меню.
+
+### VI. Безопасность данных при пересборке
+
+Операции, перезаписывающие производные листы, MUST по умолчанию использовать
+консервативные режимы (например `safe` для «Партии_в_рейсе»: только новые пары
+`(SHIPMENT_ID, Артикул ВБ)`). Режимы с перезаписью существующих строк MUST требовать
+явного подтверждения и, где применимо, снимка (бэкап-лист с меткой времени) перед
+боевым запуском.
+
+**Rationale**: ручные цены, курсы и ТНВЭД не должны теряться без ведома оператора.
+
+### VII. Язык и коммуникация
+
+Документация для владельца и ответы ассистента — на **русском**, если не запрошен
+иной язык. Сначала цель процесса для бизнеса, затем реализация. При неполных
+требованиях — 1–3 точных вопроса по критичным полям (валюта, момент проводки,
+источник правды), а не догадки.
+
+**Rationale**: владелец — носитель предметной области; код — исполнение договорённостей.
+
+## Technology & Platform
+
+- **Runtime**: Google Apps Script, Google Sheets API, триггеры по расписанию.
+- **Интеграции**: API МойСклад, Wildberries, Ozon, ЦБ РФ (курсы), Google Drive
+  (реестр платежей) — с учётом квот и лимитов времени выполнения (6 мин).
+- **Конфигурация**: Script Properties и имена листов — часть контракта; изменения
+  MUST отражаться в `README.txt` при смене контракта.
+- **Связка книг**: хаб — книга 04 (`sync_hub.gs`); операционная сводка — книга 01;
+  книги 02 и 05 не обмениваются данными напрямую, только через 01 (и хаб).
+- **Сроки в логистике**: календарные дни по умолчанию (выходные не вычитаются),
+  если для конкретного листа не задано иное.
+- **Секреты**: токены и ключи MUST NOT попадать в git (только код и документация).
+
+Долгоживущий контекст домена: `PROJECT_CONTEXT.md`. Техническая карта модулей:
+`README.txt`.
+
+## Development Workflow
+
+1. Крупные фичи — через Spec Kit: `specs/<###-name>/spec.md` → `plan.md` → `tasks.md`
+   → реализация в `.gs` → деплой владельцем.
+2. Конституция (этот файл) проверяется на этапе `/speckit-plan` (Constitution Check).
+3. Git: feature-ветки `NNN-short-name`; коммиты по смыслу; push на GitHub по запросу
+   или по расписанию (`scripts/git-sync-push.ps1`).
+4. После согласованных принципов — кратко дополнять `PROJECT_CONTEXT.md` (раздел
+   «Дополнения и договорённости»).
 
 ## Governance
-<!-- Example: Constitution supersedes all other practices; Amendments require documentation, approval, migration plan -->
 
-[GOVERNANCE_RULES]
-<!-- Example: All PRs/reviews must verify compliance; Complexity must be justified; Use [GUIDANCE_FILE] for runtime development guidance -->
+- Конституция имеет приоритет над ad-hoc практиками в чате; противоречия с
+  `PROJECT_CONTEXT.md` разрешаются обновлением обоих документов с явной фиксацией.
+- Изменения конституции: правка `.specify/memory/constitution.md`, bump версии по semver:
+  - **MAJOR**: отмена или переопределение принципа;
+  - **MINOR**: новый принцип или существенное расширение;
+  - **PATCH**: уточнения формулировок без смены смысла.
+- Каждая feature-спецификация MUST проходить Constitution Check в плане; отклонения
+  MUST быть явно обоснованы в `plan.md`.
+- Compliance: перед merge в `main` — рабочий dry-run в таблицах, где применимо.
 
-**Version**: [CONSTITUTION_VERSION] | **Ratified**: [RATIFICATION_DATE] | **Last Amended**: [LAST_AMENDED_DATE]
-<!-- Example: Version: 2.1.1 | Ratified: 2025-06-13 | Last Amended: 2025-07-16 -->
+**Version**: 1.0.0 | **Ratified**: 2026-05-19 | **Last Amended**: 2026-05-19

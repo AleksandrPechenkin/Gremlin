@@ -4,5 +4,15 @@ alwaysApply: true
 
 <!-- SPECKIT START -->
 For additional context about technologies to be used, project structure,
-shell commands, and other important information, read the current plan
+shell commands, and other important information, read the current plan:
+
+**[specs/001-sync-chain-04-02-05/plan.md](../../specs/001-sync-chain-04-02-05/plan.md)**
+
+Also use when relevant:
+- [spec.md](../../specs/001-sync-chain-04-02-05/spec.md) — feature requirements
+- [research.md](../../specs/001-sync-chain-04-02-05/research.md) — technical decisions
+- [data-model.md](../../specs/001-sync-chain-04-02-05/data-model.md) — entities & books
+- [quickstart.md](../../specs/001-sync-chain-04-02-05/quickstart.md) — verification steps
+- `.specify/memory/constitution.md` — project principles
+- `PROJECT_CONTEXT.md`, `README.txt` — Gremlin domain & module map
 <!-- SPECKIT END -->
