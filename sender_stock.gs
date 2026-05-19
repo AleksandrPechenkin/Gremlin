@@ -19,10 +19,15 @@ function addSenderStockMenu_(ui) {
     .addToUi();
 }
 
-function rebuildSenderStockData() {
-  const ss = SpreadsheetApp.getActiveSpreadsheet();
-  const movementsSheet = ensureStockMovementsSheet_(ss);
-  const balanceSheet = ensureTransitBalanceSheet_(ss);
+/**
+ * @param {GoogleAppsScript.Spreadsheet.Spreadsheet} ss — книга транзита (02)
+ * @param {{ silent?: boolean, dryRun?: boolean }} opt
+ * @returns {{ movementsCount: number, sourceSheets: number, rowsScanned: number, withEvent: number, noSender: number, noQty: number, noArticle: number, dryRun: boolean }}
+ */
+function rebuildSenderStockDataImpl_(ss, opt) {
+  opt = opt || {};
+  const dryRun = !!opt.dryRun;
+  const silent = !!opt.silent;
   const statusEventMap = loadStatusEventsMap_(ss);
   const summary = ss.getSheetByName(STOCK_CFG.SUMMARY_SHEET);
   if (!summary) throw new Error('Не найден лист "Сводная".');
@@ -40,23 +45,44 @@ function rebuildSenderStockData() {
     totalStats.noArticle += result.stats.noArticle;
   });
 
-  // Защита от повторного учета: оставляем только уникальные движения по movement_key.
   events = dedupeStockEventsByKey_(events);
 
-  writeStockMovements_(movementsSheet, events);
-  rebuildTransitBalance_(balanceSheet, events);
+  if (!dryRun) {
+    const movementsSheet = ensureStockMovementsSheet_(ss);
+    const balanceSheet = ensureTransitBalanceSheet_(ss);
+    writeStockMovements_(movementsSheet, events);
+    rebuildTransitBalance_(balanceSheet, events);
+  }
 
-  SpreadsheetApp.getUi().alert(
-    'Готово',
-    'Движений записано: ' + events.length +
-      '\nИсточников (листов): ' + sourceSheets.length +
-      '\nСтрок проверено: ' + totalStats.total +
-      '\nСо статусом движения: ' + totalStats.withEvent +
-      '\nОтброшено (пустой отправитель): ' + totalStats.noSender +
-      '\nОтброшено (qty <= 0): ' + totalStats.noQty +
-      '\nОтброшено (пустой артикул): ' + totalStats.noArticle,
-    SpreadsheetApp.getUi().ButtonSet.OK
-  );
+  const stats = {
+    movementsCount: events.length,
+    sourceSheets: sourceSheets.length,
+    rowsScanned: totalStats.total,
+    withEvent: totalStats.withEvent,
+    noSender: totalStats.noSender,
+    noQty: totalStats.noQty,
+    noArticle: totalStats.noArticle,
+    dryRun: dryRun
+  };
+
+  if (!silent) {
+    SpreadsheetApp.getUi().alert(
+      dryRun ? '🧪 Dry-run транзит' : 'Готово',
+      (dryRun ? 'Было бы записано движений: ' : 'Движений записано: ') + events.length +
+        '\nИсточников (листов): ' + sourceSheets.length +
+        '\nСтрок проверено: ' + totalStats.total +
+        '\nСо статусом движения: ' + totalStats.withEvent +
+        '\nОтброшено (пустой отправитель): ' + totalStats.noSender +
+        '\nОтброшено (qty <= 0): ' + totalStats.noQty +
+        '\nОтброшено (пустой артикул): ' + totalStats.noArticle,
+      SpreadsheetApp.getUi().ButtonSet.OK
+    );
+  }
+  return stats;
+}
+
+function rebuildSenderStockData() {
+  rebuildSenderStockDataImpl_(SpreadsheetApp.getActiveSpreadsheet(), { silent: false, dryRun: false });
 }
 
 function rebuildTransitBalanceOnly() {

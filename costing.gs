@@ -2429,12 +2429,13 @@ function costingExtractSpreadsheetId_(raw) {
  * Партии_в_рейсе → лист «Партии_в_рейсе_бэкап_YYYYMMDD_hhmm». Лог пишется в книгу 04
  * через syncHubLog_ (если функция доступна).
  *
- * @param {{ mode?: 'safe'|'refresh_qty'|'full_rebuild', dryRun?: boolean }} opts
+ * @param {{ mode?: 'safe'|'refresh_qty'|'full_rebuild', dryRun?: boolean, targetSs?: GoogleAppsScript.Spreadsheet.Spreadsheet }} opts
  * @returns {Object} отчёт по операции
  * ============================================================================== */
 function costingRebuildBatchesFromSummary_(opts) {
-  const mode = (opts && opts.mode) || 'safe';
-  const dryRun = !!(opts && opts.dryRun);
+  opts = opts || {};
+  const mode = opts.mode || 'safe';
+  const dryRun = !!opts.dryRun;
   if (['safe', 'refresh_qty', 'full_rebuild'].indexOf(mode) === -1) {
     throw new Error('Неизвестный режим: ' + mode);
   }
@@ -2443,7 +2444,7 @@ function costingRebuildBatchesFromSummary_(opts) {
   const summarySh = sourceSs.getSheetByName('Сводная');
   if (!summarySh) throw new Error('В книге 01 не найден лист «Сводная».');
 
-  const targetSs = SpreadsheetApp.getActiveSpreadsheet();
+  const targetSs = opts.targetSs || SpreadsheetApp.getActiveSpreadsheet();
   const batchesSh = costingGetSheetByRole_(targetSs, 'BATCHES');
 
   const summaryRows = costingReadSummaryShipmentRows_(summarySh);

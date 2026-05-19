@@ -78,6 +78,9 @@ function addSyncHubMenu_(ui) {
     .addSubMenu(
       ui
         .createMenu('Операционные потоки')
+        .addItem('Dry-run: цепочка отгрузки 04→02→05', 'syncShipmentChain04DryRun_')
+        .addItem('Цепочка отгрузки 04→02→05 (боевой)', 'syncShipmentChain04LiveWithConfirm_')
+        .addSeparator()
         .addItem('Dry-run: Сводная 01→02 и 03', 'syncOperationalSnapshotsDryRun_')
         .addItem('Сводная 01→02 и 03 (боевой)', 'syncOperationalSnapshotsWithConfirm_')
         .addSeparator()
@@ -441,6 +444,124 @@ function syncOperationalOrdersSummaryFrom01To03WithConfirm_() {
     return;
   }
   syncOperationalOrdersSummaryFrom01To03_(false, {});
+}
+
+/**
+ * Цепочка отгрузки из хаба 04: Сводная 01→02, пересчёт транзита в 02, safe-партии 05←01.
+ * Требует sender_stock.gs и costing.gs в том же GAS-проекте, что и sync_hub (книга 04).
+ */
+function syncShipmentChain04DryRun_() {
+  syncShipmentChain04Impl_(true, {});
+}
+
+function syncShipmentChain04LiveWithConfirm_() {
+  const ui = SpreadsheetApp.getUi();
+  const r = ui.alert(
+    'Цепочка отгрузки 04→02→05',
+    'Выполнить три шага?\n\n' +
+      '1) Сводная 01 → 02 (книга 03 не затрагивается)\n' +
+      '2) Пересчёт движений и остатков транзита (02)\n' +
+      '3) Партии_в_рейсе ← Сводная (01), режим safe (05), со снимком при записи\n\n' +
+      'Продолжить?',
+    ui.ButtonSet.YES_NO
+  );
+  if (r !== ui.Button.YES) {
+    return;
+  }
+  syncShipmentChain04Impl_(false, {});
+}
+
+function syncShipmentChain04Impl_(dryRun, opt) {
+  const silent = !!(opt && opt.silent);
+  const chainLabel = 'Цепочка 04→02→05';
+  const lines = [];
+  const lock = LockService.getScriptLock();
+  const lockTimeoutMs = syncHubGetNumberProp_(
+    SYNC_HUB_CFG.PROPS.SYNC_LOCK_TIMEOUT_MS,
+    SYNC_HUB_CFG.DEFAULTS.SYNC_LOCK_TIMEOUT_MS
+  );
+  lock.waitLock(Math.max(1000, lockTimeoutMs));
+  try {
+    let stepMsg;
+    try {
+      stepMsg = syncOperationalOrdersSummaryFrom01To02_(dryRun, { silent: true });
+      lines.push('Шаг 1 (01→02): OK — ' + stepMsg);
+    } catch (e1) {
+      const err = e1.message || String(e1);
+      syncHubLog_(chainLabel, 'ERROR', 'Шаг 1: ' + err, !!dryRun);
+      throw new Error('Шаг 1 (01→02): ' + err);
+    }
+
+    if (typeof rebuildSenderStockDataImpl_ !== 'function') {
+      throw new Error(
+        'Шаг 2: в проекте книги 04 нет sender_stock.gs (rebuildSenderStockDataImpl_). ' +
+          'Добавьте файл в деплой GAS книги 04 (см. README.txt).'
+      );
+    }
+    const ss02 = syncHubOpenSpreadsheetForBook_('02');
+    try {
+      const stockStats = rebuildSenderStockDataImpl_(ss02, { silent: true, dryRun: !!dryRun });
+      lines.push(
+        'Шаг 2 (транзит 02): OK — ' +
+          (dryRun ? 'было бы движений ' : 'движений ') +
+          stockStats.movementsCount +
+          ', строк проверено ' +
+          stockStats.rowsScanned
+      );
+    } catch (e2) {
+      const err = e2.message || String(e2);
+      syncHubLog_(chainLabel, 'ERROR', lines.join('\n') + '\nШаг 2: ' + err, !!dryRun);
+      throw new Error('Шаг 2 (транзит 02): ' + err);
+    }
+
+    if (typeof costingRebuildBatchesFromSummary_ !== 'function') {
+      throw new Error(
+        'Шаг 3: в проекте книги 04 нет costing.gs (costingRebuildBatchesFromSummary_). ' +
+          'Добавьте файл в деплой GAS книги 04 (см. README.txt).'
+      );
+    }
+    const ss05 = syncHubOpenSpreadsheetForBook_('05');
+    try {
+      const batchSummary = costingRebuildBatchesFromSummary_({
+        mode: 'safe',
+        dryRun: !!dryRun,
+        targetSs: ss05
+      });
+      let step3 = 'Шаг 3 (партии 05, safe): OK — добавится ' + batchSummary.addedCount +
+        ', без изм. ' + batchSummary.unchangedCount;
+      if (batchSummary.snapshotName) {
+        step3 += ', снимок ' + batchSummary.snapshotName;
+      }
+      lines.push(step3);
+    } catch (e3) {
+      const err = e3.message || String(e3);
+      syncHubLog_(chainLabel, 'ERROR', lines.join('\n') + '\nШаг 3: ' + err, !!dryRun);
+      throw new Error('Шаг 3 (партии 05): ' + err);
+    }
+
+    const details = lines.join('\n');
+    syncHubLog_(chainLabel, 'OK', details, !!dryRun);
+    if (!silent) {
+      SpreadsheetApp.getUi().alert(
+        dryRun ? '🧪 Dry-run: цепочка 04→02→05' : '✅ Цепочка 04→02→05',
+        details,
+        SpreadsheetApp.getUi().ButtonSet.OK
+      );
+    }
+    return details;
+  } catch (e) {
+    if (!silent) {
+      const partial = lines.length ? '\n\nУже выполнено:\n' + lines.join('\n') : '';
+      SpreadsheetApp.getUi().alert(
+        '❌ Цепочка остановлена',
+        (e.message || String(e)) + partial,
+        SpreadsheetApp.getUi().ButtonSet.OK
+      );
+    }
+    throw e;
+  } finally {
+    lock.releaseLock();
+  }
 }
 
 function syncOperationalSnapshotsImpl_(dryRun, opt) {
