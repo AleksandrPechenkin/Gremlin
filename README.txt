@@ -111,3 +111,23 @@ GitHub: https://github.com/AleksandrPechenkin/Gremlin
 
 В репозиторий не кладите токены — только код .gs, README, PROJECT_CONTEXT.md.
 .gitignore: .clasp.json, __pycache__, scripts/logs/
+
+---
+GitHub Spec Kit (spec-driven development)
+
+Установлено в проекте (интеграция Cursor Agent, PowerShell-скрипты).
+CLI: specify v0.8.11 (через uv: %USERPROFILE%\.local\bin\specify).
+
+В Cursor используйте skills (панель Agent):
+  /speckit-constitution — принципы проекта
+  /speckit-specify — спецификация фичи
+  /speckit-plan — план реализации
+  /speckit-tasks — задачи
+  /speckit-implement — реализация по плану
+
+Переустановка/обновление CLI:
+  uv tool install specify-cli --force --from git+https://github.com/github/spec-kit.git@v0.8.11
+Обновить шаблоны в проекте:
+  specify init --here --integration cursor-agent --script ps --force --ignore-agent-tools
+
+Документация: https://github.github.io/spec-kit/
