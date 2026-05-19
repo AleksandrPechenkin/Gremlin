@@ -44,6 +44,9 @@ const HISTORY_SHIPMENTS_SHEET_PREFIX = 'История отгрузок';
 /** Текст-предупреждение, который записывается в строку 1 «Сводной» при пересборке. */
 const SUMMARY_AUTO_NOTICE = '⚠️ Лист собирается автоматически (Меню → 🧩 Собрать «Сводная»). Ручной ввод данных — только в "История отгрузок" или в манерные вкладки «Имя ММ/ГГ».';
 
+/** Статус «Сводной», при котором строка создаётся/обновляется в МС (см. MS_SYNC_ORDER_STATUSES). */
+const MS_SYNC_ORDER_STATUS_DEFAULT = '03. Создание заказа';
+
 /**
  * Флаг показа меню Sync Hub в книге 01.
  * - unset / 1 / true / yes / on: меню показываем
@@ -68,6 +71,10 @@ function onOpen() {
     .addItem('💸 Обновить оплаты в таблице "Закуплено"', 'updateExternalPurchases')
     .addItem('🧩 Собрать "Сводная" из вкладок менеджеров', 'syncManagerTabsToSummary')
     .addItem('🔍 Диагностика заголовков активного таба', 'diagnoseActiveTabHeadersForSummary')
+    .addSeparator()
+    .addItem('🚛 Отгрузка → Списать выделенные строки в рейс…', 'assignSelectedRowsToShipment')
+    .addSeparator()
+    .addItem('🏢 Организации МС (для MS_ORGANIZATION_ID)', 'showMsOrganizationsForSetup')
     .addToUi();
   if (typeof addSupplierInvoiceMenu_ === 'function') {
     addSupplierInvoiceMenu_(ui);
@@ -78,9 +85,460 @@ function onOpen() {
   if (typeof addSyncHubMenu_ === 'function' && isSyncHubMenuEnabled_()) {
     addSyncHubMenu_(ui);
   }
+  if (typeof gremlinScheduleAddMenu01_ === 'function') {
+    gremlinScheduleAddMenu01_(ui);
+  }
   // Меню «Планирование закупок» живёт в книге 03 (см. main_03.gs).
   // В книге 01 его быть не должно: листов/свойств планирования здесь нет, и менеджеры
   // нажимая пункты в «не той» книге, получали бы ошибки. См. README.txt и PROJECT_CONTEXT.md.
+}
+
+/**
+ * Для синка с МС обязательны «Отгрузка через» или «Поставщик МС».
+ * Одного «Поставщик» (фабрика/ФИО) недостаточно — иначе контрагент в МС не определён.
+ */
+function isMsSyncLogisticsReady_(row) {
+  return (
+    !syncManagerBlankish_(row[COL.SUPPLIER_MS]) || !syncManagerBlankish_(row[COL.DELIVERY_TYPE])
+  );
+}
+
+function isMsSyncSpecReady_(row) {
+  return !syncManagerBlankish_(row[COL.SPEC_NUMBER]);
+}
+
+/** Кандидаты на контрагента в МС (порядок: «Поставщик МС» → «Отгрузка через» → «Поставщик»). */
+function collectSupplierNameCandidates_(row) {
+  const out = [];
+  const add = function (v) {
+    const s = safeString(v);
+    if (!s) return;
+    let i;
+    for (i = 0; i < out.length; i++) {
+      if (out[i].toLowerCase() === s.toLowerCase()) return;
+    }
+    out.push(s);
+  };
+  add(row[COL.SUPPLIER_MS]);
+  add(row[COL.DELIVERY_TYPE]);
+  if (isMsSyncLogisticsReady_(row)) add(row[COL.SUPPLIER_NOTE]);
+  return out;
+}
+
+function findSummaryHeaderRowIndex_(data) {
+  const limit = Math.min(data.length, 15);
+  let bestIdx = MANAGER_SUMMARY_SYNC_HEADER_ROW - 1;
+  let bestScore = 0;
+  let r;
+  for (r = 0; r < limit; r++) {
+    const row = data[r] || [];
+    let score = 0;
+    let c;
+    for (c = 0; c < row.length; c++) {
+      const key = syncManagerHeaderKey_(syncManagerCanonHeader_(row[c]));
+      if (key === 'wb_article') score += 3;
+      if (key === 'barcode') score += 2;
+      if (key === 'supplier_note' || key === 'supplier_ms') score += 2;
+      if (key === 'spec_number') score += 2;
+      if (key === 'total_qty' || key === 'qty') score += 1;
+      if (key === 'script_status' || key === 'ms_id') score += 1;
+    }
+    if (score > bestScore) {
+      bestScore = score;
+      bestIdx = r;
+    }
+  }
+  return bestIdx;
+}
+
+function buildMsSyncKeyToCol_(headerRow) {
+  const keyToCol = {};
+  let c;
+  for (c = 0; c < headerRow.length; c++) {
+    const key = syncManagerHeaderKey_(syncManagerCanonHeader_(headerRow[c]));
+    if (key && keyToCol[key] == null) keyToCol[key] = c;
+  }
+  return keyToCol;
+}
+
+function buildMsSyncLayout_(data) {
+  const headerRowIdx = findSummaryHeaderRowIndex_(data);
+  const headerRow = data[headerRowIdx] || [];
+  const keyToCol = buildMsSyncKeyToCol_(headerRow);
+  return {
+    headerRowIdx: headerRowIdx,
+    keyToCol: keyToCol,
+    colStatus: keyToCol.script_status != null ? keyToCol.script_status : COL.STATUS,
+    colMsId: keyToCol.ms_id != null ? keyToCol.ms_id : COL.MS_ID,
+    colMsLink: keyToCol.ms_link != null ? keyToCol.ms_link : COL.MS_LINK
+  };
+}
+
+/** Строка листа → канонический массив по COL (по заголовкам, а не по фиксированным буквам колонок). */
+function rowToCanonicalForMsSync_(rawRow, keyToCol) {
+  const canonHeaders = syncManagerSummaryCanonicalHeader_();
+  const canonKeys = canonHeaders.map(function (h) {
+    return syncManagerHeaderKey_(syncManagerCanonHeader_(h));
+  });
+  const out = new Array(canonKeys.length).fill('');
+  let i;
+  for (i = 0; i < canonKeys.length; i++) {
+    const key = canonKeys[i];
+    if (!key) continue;
+    const src = keyToCol[key];
+    if (src != null && src < rawRow.length) out[i] = rawRow[src];
+  }
+  return out;
+}
+
+function lookupMsSupplier_(candidates, supplierMap) {
+  let i;
+  for (i = 0; i < candidates.length; i++) {
+    const name = candidates[i];
+    const cacheKey = '__name__' + name.toLowerCase();
+    if (cache.suppliers[cacheKey] !== undefined) {
+      if (cache.suppliers[cacheKey]) return { supplier: cache.suppliers[cacheKey], name: name };
+      continue;
+    }
+    const lookupName = name.toLowerCase();
+    const msCode = supplierMap[lookupName];
+    const supplier = msCode ? findCounterpartyByName(msCode) : findCounterpartyByName(name);
+    cache.suppliers[cacheKey] = supplier || null;
+    if (supplier) return { supplier: supplier, name: name };
+  }
+  return { supplier: null, name: candidates[0] || '' };
+}
+
+function normalizeOrderStatusForMsSync_(val) {
+  return safeString(val)
+    .toLowerCase()
+    .replace(/ё/g, 'е')
+    .replace(/\s+/g, ' ')
+    .trim();
+}
+
+/** Список допустимых статусов из MS_SYNC_ORDER_STATUSES или значение по умолчанию. */
+function getMsSyncOrderStatusPatterns_() {
+  const raw = getScriptProp('MS_SYNC_ORDER_STATUSES', '');
+  const parts = raw ? String(raw).split(/[,;|]/) : [MS_SYNC_ORDER_STATUS_DEFAULT];
+  const out = [];
+  let i;
+  for (i = 0; i < parts.length; i++) {
+    const n = normalizeOrderStatusForMsSync_(parts[i]);
+    if (n && out.indexOf(n) < 0) out.push(n);
+  }
+  return out.length ? out : [normalizeOrderStatusForMsSync_(MS_SYNC_ORDER_STATUS_DEFAULT)];
+}
+
+function orderStatusEligibleForMsSync_(status) {
+  const norm = normalizeOrderStatusForMsSync_(status);
+  if (!norm) return false;
+  const patterns = getMsSyncOrderStatusPatterns_();
+  let i;
+  for (i = 0; i < patterns.length; i++) {
+    const p = patterns[i];
+    if (!p) continue;
+    if (norm === p) return true;
+    const codeM = p.match(/^(\d{2})\./);
+    if (codeM && norm.indexOf(codeM[1] + '.') === 0) return true;
+    const phrase = p.replace(/^\d{2}\.\s*/, '');
+    if (phrase.length >= 6 && norm.indexOf(phrase) >= 0) return true;
+  }
+  return false;
+}
+
+function getMsSyncOrderStatusHint_() {
+  return getMsSyncOrderStatusPatterns_()
+    .map(function (p) {
+      return '«' + p + '»';
+    })
+    .join(', ');
+}
+
+function getCanonicalHeaderKeys_() {
+  return syncManagerSummaryCanonicalHeader_().map(function (h) {
+    return syncManagerHeaderKey_(syncManagerCanonHeader_(h));
+  });
+}
+
+/** Ключ сопоставления строки Сводной ↔ вкладки-источника (без MS_ID — он как раз пишется). */
+function buildMsRowMatchKey_(row) {
+  const supplier =
+    safeString(row[COL.SUPPLIER_MS]) ||
+    safeString(row[COL.DELIVERY_TYPE]) ||
+    safeString(row[COL.SUPPLIER_NOTE]);
+  return [
+    safeString(row[COL.WB_ARTICLE]),
+    safeString(row[COL.BARCODE]),
+    safeString(row[COL.SUPPLIER_ARTICLE]),
+    safeString(row[COL.SPEC_NUMBER]),
+    supplier,
+    syncManagerNormalizeManagerToken_(safeString(row[COL.MANAGER]))
+  ]
+    .join('||')
+    .toLowerCase();
+}
+
+function readSourceSheetLayout_(sheet) {
+  const lc = Math.max(sheet.getLastColumn(), 1);
+  const headerRaw =
+    sheet.getRange(MANAGER_SUMMARY_SYNC_HEADER_ROW, 1, 1, lc).getValues()[0] || [];
+  const srcHeaderKeys = headerRaw.map(function (h) {
+    return syncManagerHeaderKey_(syncManagerCanonHeader_(h));
+  });
+  const srcMap = syncManagerBuildHeaderIndex_(srcHeaderKeys);
+  return { srcMap: srcMap, lastCol: lc };
+}
+
+/**
+ * Колонки для записи результатов синка. Существующие — по заголовку;
+ * недостающие MS_ID / MS_LINK / «Статус скрипта» — только в конец листа (оплаты не сдвигаются).
+ */
+function ensureMsWriteColumnsOnSource_(sheet, srcMap) {
+  const writeCols = {
+    msId: srcMap.ms_id != null ? srcMap.ms_id : null,
+    msLink: srcMap.ms_link != null ? srcMap.ms_link : null,
+    scriptStatus: srcMap.script_status != null ? srcMap.script_status : null,
+    msOrderSheet: srcMap.ms_order_sheet != null ? srcMap.ms_order_sheet : null
+  };
+  let nextCol = Math.max(sheet.getLastColumn(), 1) + 1;
+  const headerRow = MANAGER_SUMMARY_SYNC_HEADER_ROW;
+  if (writeCols.msId == null) {
+    sheet.getRange(headerRow, nextCol).setValue('MS_ID');
+    writeCols.msId = nextCol - 1;
+    nextCol++;
+  }
+  if (writeCols.msLink == null) {
+    sheet.getRange(headerRow, nextCol).setValue('MS_LINK');
+    writeCols.msLink = nextCol - 1;
+    nextCol++;
+  }
+  if (writeCols.scriptStatus == null) {
+    sheet.getRange(headerRow, nextCol).setValue('Статус скрипта');
+    writeCols.scriptStatus = nextCol - 1;
+    nextCol++;
+  }
+  return writeCols;
+}
+
+function buildSheetRowKeyIndex_(sheet, layout, headerKeys) {
+  const index = {};
+  const lr = sheet.getLastRow();
+  if (lr < MANAGER_SUMMARY_SYNC_DATA_START_ROW) return index;
+  const block = sheet
+    .getRange(MANAGER_SUMMARY_SYNC_DATA_START_ROW, 1, lr, layout.lastCol)
+    .getValues();
+  let r;
+  for (r = 0; r < block.length; r++) {
+    const aligned = syncManagerAlignRowToHeader_(block[r], headerKeys, layout.srcMap);
+    if (syncManagerSummaryRowIgnorable_(aligned)) continue;
+    const key = buildMsRowMatchKey_(aligned);
+    if (!key || key === '||||||') continue;
+    const sheetRow = MANAGER_SUMMARY_SYNC_DATA_START_ROW + r;
+    if (!index[key]) index[key] = [];
+    index[key].push(sheetRow);
+  }
+  return index;
+}
+
+/** Индекс вкладок-источников для обратной записи MS_ID (менеджерские + история). */
+function buildMsSourceWriteContext_(ss) {
+  const headerKeys = getCanonicalHeaderKeys_();
+  const ex = syncManagerSummaryExcludeSet_();
+  const entries = [];
+  const sheets = ss.getSheets();
+  let i;
+  for (i = 0; i < sheets.length; i++) {
+    const sh = sheets[i];
+    const nameTrim = safeString(sh.getName()).trim();
+    if (nameTrim === safeString(SHEET_NAME).trim()) continue;
+    if (syncManagerSheetIsExcluded_(nameTrim, ex)) continue;
+    if (sh.getLastRow() < MANAGER_SUMMARY_SYNC_DATA_START_ROW) continue;
+
+    let kind = '';
+    let meta = null;
+    if (syncManagerIsHistoryShipmentsSheet_(nameTrim)) {
+      kind = 'history';
+    } else {
+      meta = syncManagerSummaryParseManagerMonthTab_(nameTrim);
+      if (!meta) continue;
+      kind = 'manager_month';
+    }
+
+    const layout = readSourceSheetLayout_(sh);
+    layout.writeCols = ensureMsWriteColumnsOnSource_(sh, layout.srcMap);
+    layout.lastCol = Math.max(sh.getLastColumn(), layout.lastCol);
+    layout.rowIndex = buildSheetRowKeyIndex_(sh, layout, headerKeys);
+
+    entries.push({
+      sheet: sh,
+      name: nameTrim,
+      kind: kind,
+      meta: meta,
+      layout: layout,
+      managerKey: meta
+        ? syncManagerNormalizeManagerToken_(meta.manager).toLowerCase()
+        : ''
+    });
+  }
+  return { headerKeys: headerKeys, entries: entries, written: 0, notFound: 0 };
+}
+
+function findSourceRowForCanonical_(ctx, canonicalRow) {
+  const matchKey = buildMsRowMatchKey_(canonicalRow);
+  if (!matchKey || matchKey === '||||||') return null;
+
+  const manager = syncManagerNormalizeManagerToken_(safeString(canonicalRow[COL.MANAGER])).toLowerCase();
+  let pass;
+  for (pass = 0; pass < 2; pass++) {
+    let e;
+    for (e = 0; e < ctx.entries.length; e++) {
+      const entry = ctx.entries[e];
+      if (pass === 0 && manager) {
+        if (entry.kind === 'manager_month' && entry.managerKey !== manager) continue;
+      }
+      const rows = entry.layout.rowIndex[matchKey];
+      if (!rows || !rows.length) continue;
+      return {
+        sheet: entry.sheet,
+        sheetName: entry.name,
+        sheetRow: rows[0],
+        writeCols: entry.layout.writeCols
+      };
+    }
+    if (!manager) break;
+  }
+  return null;
+}
+
+/** Только ячейки MS — остальные колонки (оплаты, даты и т.д.) не трогаем. */
+function writeMsFieldsToSourceRow_(hit, patch) {
+  if (!hit || !patch) return false;
+  const sh = hit.sheet;
+  const r = hit.sheetRow;
+  const c = hit.writeCols;
+  if (patch.msId != null && patch.msId !== '' && c.msId != null) {
+    sh.getRange(r, c.msId + 1).setValue(patch.msId);
+    if (c.msOrderSheet != null) sh.getRange(r, c.msOrderSheet + 1).setValue(patch.msId);
+  }
+  if (patch.msLink != null && patch.msLink !== '' && c.msLink != null) {
+    sh.getRange(r, c.msLink + 1).setValue(patch.msLink);
+  }
+  if (patch.status != null && patch.status !== '' && c.scriptStatus != null) {
+    sh.getRange(r, c.scriptStatus + 1).setValue(patch.status);
+  }
+  return true;
+}
+
+function resolveSourceTabName_(ctx, canonicalRow) {
+  const hit = findSourceRowForCanonical_(ctx, canonicalRow);
+  return hit && hit.sheetName ? hit.sheetName : '';
+}
+
+/** Уникальные имена вкладок-источников для строк одной группы заказа. */
+function resolveSourceTabNamesForGroup_(ctx, groupRows) {
+  const names = [];
+  const seen = {};
+  let i;
+  for (i = 0; i < groupRows.length; i++) {
+    const n = resolveSourceTabName_(ctx, groupRows[i].rowData);
+    if (!n) continue;
+    const k = n.toLowerCase();
+    if (seen[k]) continue;
+    seen[k] = true;
+    names.push(n);
+  }
+  return names;
+}
+
+function msSyncWriteToSourceTab_(ctx, canonicalRow, patch) {
+  const hit = findSourceRowForCanonical_(ctx, canonicalRow);
+  if (!hit) {
+    ctx.notFound++;
+    return false;
+  }
+  if (writeMsFieldsToSourceRow_(hit, patch)) {
+    ctx.written++;
+    return true;
+  }
+  return false;
+}
+
+/** Сводная + вкладка-источник: пишем только MS_ID / MS_LINK / статус скрипта. */
+function msSyncApplyRowPatch_(ctx, updater, layout, rowIndex, canonicalRow, patch) {
+  if (patch.msId != null && patch.msId !== '') updater.setValue(rowIndex, layout.colMsId, patch.msId);
+  if (patch.msLink != null && patch.msLink !== '') updater.setValue(rowIndex, layout.colMsLink, patch.msLink);
+  if (patch.status != null && patch.status !== '') updater.setStatus(rowIndex, patch.status);
+  msSyncWriteToSourceTab_(ctx, canonicalRow, patch);
+}
+
+/** UUID из id, ссылки meta.href или текста в MS_ORGANIZATION_ID. */
+function normalizeMsEntityId_(raw) {
+  const s = String(raw == null ? '' : raw).trim();
+  if (!s) return '';
+  const m = s.match(/([0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12})/i);
+  return m ? m[1] : s;
+}
+
+/** Проверка MS_ORGANIZATION_ID до массовых запросов в МС. */
+function validateMsOrganization_() {
+  const orgId = normalizeMsEntityId_(CONFIG.MS_ORGANIZATION_ID);
+  if (!orgId) {
+    return { ok: false, orgId: '', error: 'Пустой MS_ORGANIZATION_ID' };
+  }
+  const res = msGet('/entity/organization/' + encodeURIComponent(orgId));
+  if (res.success && res.data && res.data.id) {
+    return { ok: true, orgId: res.data.id, name: safeString(res.data.name) || orgId };
+  }
+  return {
+    ok: false,
+    orgId: orgId,
+    error: res.error || 'Организация не найдена в аккаунте МойСклад (проверьте токен и id).'
+  };
+}
+
+/** Список организаций аккаунта (меню настройки MS_ORGANIZATION_ID). */
+function fetchMsOrganizationsList_() {
+  const res = msGet('/entity/organization?limit=100');
+  if (!res.success || !res.data || !res.data.rows) {
+    return { ok: false, error: res.error || 'Не удалось получить список организаций', rows: [] };
+  }
+  return { ok: true, rows: res.data.rows, error: '' };
+}
+
+/** Показать id организаций аккаунта МС — для свойства MS_ORGANIZATION_ID. */
+function showMsOrganizationsForSetup() {
+  const ui = SpreadsheetApp.getUi();
+  let currentId = '';
+  try {
+    currentId = normalizeMsEntityId_(CONFIG.MS_ORGANIZATION_ID);
+  } catch (e) {
+    currentId = '(не задано)';
+  }
+
+  const list = fetchMsOrganizationsList_();
+  if (!list.ok) {
+    ui.alert('Не удалось загрузить организации МойСклад', String(list.error || ''), ui.ButtonSet.OK);
+    return;
+  }
+  if (!list.rows.length) {
+    ui.alert('В аккаунте МойСклад нет организаций или нет доступа по токену MS_TOKEN.', ui.ButtonSet.OK);
+    return;
+  }
+
+  const lines = [
+    'Скопируйте id нужной организации в Script Property MS_ORGANIZATION_ID',
+    '(Расширения → Apps Script → Свойства скрипта / Project Settings → Script properties).',
+    '',
+    'Сейчас в MS_ORGANIZATION_ID: ' + currentId,
+    ''
+  ];
+  list.rows.forEach(function (org, idx) {
+    const mark = org.id === currentId ? ' ← сейчас в свойствах' : '';
+    lines.push((idx + 1) + '. ' + safeString(org.name) + '\n   id: ' + org.id + mark);
+  });
+
+  ui.alert('Организации МойСклад', lines.join('\n'), ui.ButtonSet.OK);
 }
 
 function syncOrdersWithMS() {
@@ -90,35 +548,110 @@ function syncOrdersWithMS() {
     return SpreadsheetApp.getUi().alert(`Ошибка настройки: ${error.message}`);
   }
 
+  const orgCheck = validateMsOrganization_();
+  if (!orgCheck.ok) {
+    return SpreadsheetApp.getUi().alert(
+      'Синхронизация остановлена: организация из MS_ORGANIZATION_ID не найдена в МойСклад.\n\n' +
+        'id в свойствах: ' +
+        orgCheck.orgId +
+        '\n' +
+        orgCheck.error +
+        '\n\n' +
+        'Частые причины:\n' +
+        '• id от другого аккаунта МС или устаревший после пересоздания организации;\n' +
+        '• MS_TOKEN от другого аккаунта, чем id организации.\n\n' +
+        'Меню → 📦 МойСклад → 🏢 Организации МС — скопируйте верный id в свойства скрипта.'
+    );
+  }
+
   const ss = SpreadsheetApp.getActiveSpreadsheet();
   const sheet = ss.getSheetByName(SHEET_NAME);
-  const data = sheet.getDataRange().getValues();
-  if (data.length < 3) return;
+  if (!sheet) {
+    return SpreadsheetApp.getUi().alert(`Не найден лист «${SHEET_NAME}».`);
+  }
 
-  const updater = new BatchUpdater(sheet, data);
+  const data = sheet.getDataRange().getValues();
+  const layout = buildMsSyncLayout_(data);
+  const headerRowIdx = layout.headerRowIdx;
+  const dataStartIdx = headerRowIdx + 1;
+  if (data.length <= dataStartIdx) {
+    return SpreadsheetApp.getUi().alert(
+      'На листе «Сводная» нет строк данных под шапкой (шапка найдена в строке ' +
+        (headerRowIdx + 1) +
+        ').\n\n' +
+        'Сначала: 📦 МойСклад → 🧩 Собрать «Сводная» из вкладок менеджеров.'
+    );
+  }
+
+  const updater = new BatchUpdater(sheet, data, layout);
+  const sourceCtx = buildMsSourceWriteContext_(ss);
   const groups = {};
+  let skippedByStatus = 0;
+  let skippedByShipVia = 0;
+  let skippedBySpec = 0;
   
   const originalMsIds = new Set();
+  const statusHint = getMsSyncOrderStatusHint_();
 
-  for (let i = 2; i < data.length; i++) {
-    const row = data[i];
-    const supplierName = safeString(row[COL.SUPPLIER_MS]); 
+  for (let i = dataStartIdx; i < data.length; i++) {
+    const row = rowToCanonicalForMsSync_(data[i], layout.keyToCol);
+    const candidates = collectSupplierNameCandidates_(row);
+    const supplierName = candidates.length ? candidates[0] : '';
     const specNum = safeString(row[COL.SPEC_NUMBER]);
     const msId = safeString(row[COL.MS_ID]);
+    const orderStatus = safeString(row[COL.ORDER_STATUS]);
+    const hasLine =
+      safeString(row[COL.WB_ARTICLE]) ||
+      safeString(row[COL.SUPPLIER_ARTICLE]) ||
+      safeString(row[COL.BARCODE]);
+    const statusOk = orderStatusEligibleForMsSync_(orderStatus);
+
+    if ((hasLine || supplierName) && !statusOk) {
+      skippedByStatus++;
+      msSyncApplyRowPatch_(sourceCtx, updater, layout, i, row, {
+        status: '⏭ Пропуск: статус «' + (orderStatus || 'пусто') + '» (нужен ' + statusHint + ')'
+      });
+      continue;
+    }
+
+    if (statusOk && hasLine && !isMsSyncLogisticsReady_(row)) {
+      skippedByShipVia++;
+      msSyncApplyRowPatch_(sourceCtx, updater, layout, i, row, {
+        status: '⚠️ Пропуск: не заполнено «Отгрузка через» (или «Поставщик МС»)'
+      });
+      continue;
+    }
+
+    if (statusOk && hasLine && !isMsSyncSpecReady_(row)) {
+      skippedBySpec++;
+      msSyncApplyRowPatch_(sourceCtx, updater, layout, i, row, {
+        status: '⚠️ Пропуск: не заполнен номер спецификации / инвойса'
+      });
+      continue;
+    }
 
     if (msId && msId !== 'ID заказа МС') originalMsIds.add(msId);
 
     if (!supplierName) { 
-      if (safeString(row[COL.WB_ARTICLE]) || safeString(row[COL.SUPPLIER_ARTICLE])) {
-        updater.setStatus(i, '⚠️ Пропуск: нет поставщика в колонке R'); 
+      if (hasLine && statusOk) {
+        msSyncApplyRowPatch_(sourceCtx, updater, layout, i, row, {
+          status: '⚠️ Пропуск: не заполнено «Отгрузка через» (или «Поставщик МС»)'
+        });
       }
       continue; 
     }
 
-    const finalSpecNum = specNum || ('NO-SPEC-' + supplierName);
-    const groupKey = supplierName + '|||' + finalSpecNum;
+    const groupKey = supplierName + '|||' + specNum;
 
-    if (!groups[groupKey]) groups[groupKey] = { supplierName: supplierName, specNum: specNum, candidateMsIds: [], rows: [] };
+    if (!groups[groupKey]) {
+      groups[groupKey] = {
+        supplierName: supplierName,
+        supplierCandidates: candidates,
+        specNum: specNum,
+        candidateMsIds: [],
+        rows: []
+      };
+    }
     groups[groupKey].rows.push({ rowIndex: i, rowData: row });
 
     if (msId && msId !== 'ID заказа МС') groups[groupKey].candidateMsIds.push(msId);
@@ -144,23 +677,47 @@ function syncOrdersWithMS() {
   }
 
   let createdOrders = 0, updatedOrders = 0, deletedOrders = 0, errorCount = 0;
+
+  if (!Object.keys(groups).length) {
+    updater.flush();
+    const activeTab = safeString(ss.getActiveSheet().getName());
+    const onSummary = activeTab === SHEET_NAME;
+    return SpreadsheetApp.getUi().alert(
+      'Синхронизация завершена: не найдено строк для заказов в МС.\n\n' +
+        'Скрипт обрабатывает только лист «Сводная» (не вкладку менеджера).\n' +
+        (onSummary
+          ? '• Заполните «Поставщик МС», «Отгрузка через» или «Поставщик» (и артикулы/ШК).\n' +
+            '  Шапка распознана в строке ' +
+            (headerRowIdx + 1) +
+            '.\n'
+          : '• Сейчас открыта вкладка «' + activeTab + '» — соберите Сводную:\n' +
+            '  📦 МойСклад → 🧩 Собрать «Сводная» из вкладок менеджеров.\n' +
+            '• Затем снова «Синхронизировать заказы».\n') +
+        '• Контрагент в МС ищется по «Внутреннее название» в справочнике\n' +
+        '  (часто это «Отгрузка через», а не ФИО в «Поставщик»).\n' +
+        '• В МС уходят только строки со статусом: ' +
+        statusHint +
+        '.'
+    );
+  }
   
   const supplierMap = getSupplierCodeMap();
 
   for (const key in groups) {
     const group = groups[key];
-    const lookupName = group.supplierName.toLowerCase();
-    const msCode = supplierMap[lookupName];
-    
-    let supplier = cache.suppliers[group.supplierName];
-    if (supplier === undefined) {
-      supplier = msCode ? findCounterpartyByName(msCode) : findCounterpartyByName(group.supplierName);
-      cache.suppliers[group.supplierName] = supplier;
-    }
+    const candidates = group.supplierCandidates && group.supplierCandidates.length
+      ? group.supplierCandidates
+      : [group.supplierName];
+    const found = lookupMsSupplier_(candidates, supplierMap);
+    const supplier = found.supplier;
 
     if (!supplier) { 
-      const searchTarget = msCode ? `Код: ${msCode}` : `Имя: ${group.supplierName} (нет в справочнике)`;
-      group.rows.forEach(r => updater.setStatus(r.rowIndex, `❌ Не найден в МС: [${group.supplierName}] -> ${searchTarget}`)); 
+      const tried = candidates.join(' → ');
+      group.rows.forEach(function (r) {
+        msSyncApplyRowPatch_(sourceCtx, updater, layout, r.rowIndex, r.rowData, {
+          status: '❌ Не найден в МС, пробовали: ' + tried
+        });
+      });
       errorCount++; 
       continue; 
     }
@@ -175,7 +732,13 @@ function syncOrdersWithMS() {
 
     for (const item of group.rows) {
       let product = getOrCreateProduct(item.rowData);
-      if (!product) { updater.setStatus(item.rowIndex, '❌ Ошибка товара'); hasErrors = true; continue; }
+      if (!product) {
+        msSyncApplyRowPatch_(sourceCtx, updater, layout, item.rowIndex, item.rowData, {
+          status: '❌ Ошибка товара'
+        });
+        hasErrors = true;
+        continue;
+      }
       
       const qty = parseNumber(item.rowData[COL.TOTAL_QTY]) || parseNumber(item.rowData[COL.QTY]) || 1;
       const priceKopecks = Math.round((parseNumber(item.rowData[COL.PRICE]) || 0) * 100);
@@ -193,33 +756,52 @@ function syncOrdersWithMS() {
     let mergedPaymentData = extractPaymentData(group.rows[0].rowData);
     for (let i = 1; i < group.rows.length; i++) mergedPaymentData = mergePayments(mergedPaymentData, extractPaymentData(group.rows[i].rowData));
 
-    const payload = buildPurchaseOrderPayload(group.rows[0].rowData, supplier, positions, mergedPaymentData);
+    const sourceTabNames = resolveSourceTabNamesForGroup_(sourceCtx, group.rows);
+    const payload = buildPurchaseOrderPayload(
+      group.rows[0].rowData,
+      supplier,
+      positions,
+      mergedPaymentData,
+      sourceTabNames
+    );
 
     let res;
     if (group.msId) {
       res = msFetch('/entity/purchaseorder/' + encodeURIComponent(group.msId), 'put', payload);
       if (res.success) {
-        group.rows.forEach(item => {
-          updater.setValue(item.rowIndex, COL.MS_ID, group.msId);
-          updater.setValue(item.rowIndex, COL.MS_LINK, res.data ? res.data.meta.uuidHref : item.rowData[COL.MS_LINK]);
-          updater.setStatus(item.rowIndex, '🔄 Обновлено в МС (Синхронизировано)');
+        group.rows.forEach(function (item) {
+          msSyncApplyRowPatch_(sourceCtx, updater, layout, item.rowIndex, item.rowData, {
+            msId: group.msId,
+            msLink: res.data ? res.data.meta.uuidHref : item.rowData[COL.MS_LINK],
+            status: '🔄 Обновлено в МС (Синхронизировано)'
+          });
         });
         updatedOrders++;
       } else {
-        group.rows.forEach(item => updater.setStatus(item.rowIndex, '❌ Ошибка обн.: ' + res.error));
+        group.rows.forEach(function (item) {
+          msSyncApplyRowPatch_(sourceCtx, updater, layout, item.rowIndex, item.rowData, {
+            status: '❌ Ошибка обн.: ' + res.error
+          });
+        });
         errorCount++;
       }
     } else {
       res = msFetch('/entity/purchaseorder', 'post', payload);
       if (res.success && res.data) {
-        group.rows.forEach(item => {
-          updater.setValue(item.rowIndex, COL.MS_ID, res.data.id);
-          updater.setValue(item.rowIndex, COL.MS_LINK, res.data.meta.uuidHref || '');
-          updater.setStatus(item.rowIndex, '✅ Создан новый заказ в МС');
+        group.rows.forEach(function (item) {
+          msSyncApplyRowPatch_(sourceCtx, updater, layout, item.rowIndex, item.rowData, {
+            msId: res.data.id,
+            msLink: res.data.meta.uuidHref || '',
+            status: '✅ Создан новый заказ в МС'
+          });
         });
         createdOrders++;
       } else {
-        group.rows.forEach(item => updater.setStatus(item.rowIndex, '❌ Ошибка созд.: ' + res.error));
+        group.rows.forEach(function (item) {
+          msSyncApplyRowPatch_(sourceCtx, updater, layout, item.rowIndex, item.rowData, {
+            status: '❌ Ошибка созд.: ' + res.error
+          });
+        });
         errorCount++;
       }
     }
@@ -238,7 +820,30 @@ function syncOrdersWithMS() {
   }
   
   updater.flush();
-  SpreadsheetApp.getUi().alert(`Синхронизация завершена!\n\n🆕 Создано: ${createdOrders}\n🔄 Обновлено: ${updatedOrders}\n🗑️ Удалено/Очищено брошенных: ${deletedOrders}\n❌ Ошибок: ${errorCount}`);
+  SpreadsheetApp.getUi().alert(
+    'Синхронизация завершена!\n\n' +
+      '🆕 Создано: ' +
+      createdOrders +
+      '\n🔄 Обновлено: ' +
+      updatedOrders +
+      '\n⏭ Пропущено (другой статус): ' +
+      skippedByStatus +
+      '\n⏭ Пропущено (нет «Отгрузка через»): ' +
+      skippedByShipVia +
+      '\n⏭ Пропущено (нет спецификации): ' +
+      skippedBySpec +
+      '\n🗑️ Удалено/Очищено брошенных: ' +
+      deletedOrders +
+      '\n❌ Ошибок: ' +
+      errorCount +
+      '\n\nВ МС синхронизируются только строки со статусом: ' +
+      statusHint +
+      '.\n' +
+      '📋 Записано на вкладки-источники: ' +
+      sourceCtx.written +
+      (sourceCtx.notFound ? ' (не найдена строка: ' + sourceCtx.notFound + ')' : '') +
+      '.'
+  );
 }
 
 /**
@@ -253,11 +858,25 @@ function syncOrdersWithMS() {
  * со строками «Партии_в_рейсе» книги 05.
  */
 function syncManagerTabsToSummary() {
-  const ui = SpreadsheetApp.getUi();
-  const ss = SpreadsheetApp.getActiveSpreadsheet();
+  syncManagerTabsToSummaryImpl_(SpreadsheetApp.getActiveSpreadsheet(), {});
+}
+
+/**
+ * @param {GoogleAppsScript.Spreadsheet.Spreadsheet} ss
+ * @param {{ silent?: boolean }} opt
+ * @returns {string|void}
+ */
+function syncManagerTabsToSummaryImpl_(ss, opt) {
+  const silent = !!(opt && opt.silent);
+  const ui = silent ? null : SpreadsheetApp.getUi();
+  if (!ss) {
+    throw new Error('Не передана книга для сборки Сводной.');
+  }
   const summarySh = ss.getSheetByName(SHEET_NAME);
   if (!summarySh) {
-    ui.alert('Не найден лист «' + SHEET_NAME + '».');
+    const msg = 'Не найден лист «' + SHEET_NAME + '».';
+    if (silent) throw new Error(msg);
+    ui.alert(msg);
     return;
   }
 
@@ -298,59 +917,49 @@ function syncManagerTabsToSummary() {
   });
 
   if (!sources.length) {
-    ui.alert(
+    const noSrcMsg =
       'Нет вкладок для сборки.\n' +
-        'Ожидаются вкладки «Имя ММ/ГГ» (например «Нина 07/26») или листы с префиксом «' +
-        HISTORY_SHIPMENTS_SHEET_PREFIX +
-        '».\n' +
-        'Данные должны начинаться со строки ' +
-        MANAGER_SUMMARY_SYNC_DATA_START_ROW +
-        '. Исключены «Сводная», справочники и системные листы.'
-    );
+      'Ожидаются вкладки «Имя ММ/ГГ» (например «Нина 07/26») или листы с префиксом «' +
+      HISTORY_SHIPMENTS_SHEET_PREFIX +
+      '».\n' +
+      'Данные должны начинаться со строки ' +
+      MANAGER_SUMMARY_SYNC_DATA_START_ROW +
+      '. Исключены «Сводная», справочники и системные листы.';
+    if (silent) throw new Error(noSrcMsg.replace(/\n/g, ' '));
+    ui.alert(noSrcMsg);
     return;
   }
 
-  let maxCol = Math.max(summarySh.getLastColumn(), COL.STATUS + 1, COL.SHIPMENT_ID + 1);
-  let widest = sources[0].sheet;
-  for (i = 0; i < sources.length; i++) {
-    const sht = sources[i].sheet;
-    maxCol = Math.max(maxCol, sht.getLastColumn());
-    if (sht.getLastColumn() > widest.getLastColumn()) {
-      widest = sht;
-    }
-  }
-
-  const headerSheet = widest;
-  const headerRaw =
-    headerSheet
-      .getRange(
-        MANAGER_SUMMARY_SYNC_HEADER_ROW,
-        1,
-        MANAGER_SUMMARY_SYNC_HEADER_ROW,
-        headerSheet.getLastColumn()
-      )
-      .getValues()[0] || [];
-  const header = syncManagerSummaryPad_(headerRaw, maxCol);
-  let headerKeys = header.map(function (h) {
+  // Целевая раскладка Сводной — каноническая, по COL-константам (см.
+  // syncManagerSummaryCanonicalHeader_). widest-эвристика убрана: она привязывала
+  // структуру Сводной к произвольному порядку колонок в менеджерских табах,
+  // ломала валидации/условное форматирование и приводила к подмене столбцов
+  // (например, «Менеджер» затирал значение «Статус заказа» в колонке H, потому что
+  // в «Никита 07/26» «Статус заказа» стоит на позиции 8, а «Менеджер» отсутствует).
+  const header = syncManagerSummaryCanonicalHeader_();
+  const headerKeys = header.map(function (h) {
     const canon = syncManagerCanonHeader_(h);
     return syncManagerHeaderKey_(canon);
   });
-  let headerKeyToIdx = syncManagerBuildHeaderIndex_(headerKeys);
+  const headerKeyToIdx = syncManagerBuildHeaderIndex_(headerKeys);
 
-  // Гарантируем, что в заголовке Сводной есть колонка «Рейс» (SHIPMENT_ID).
-  // Если её нет ни в widest, ни в существующей Сводной — добавляем в конец.
-  const ensured = syncManagerSummaryEnsureRequiredKeys_(
-    header,
-    headerKeys,
-    headerKeyToIdx,
-    sources,
-    summarySh,
-    [{ key: 'shipment_id', defaultDisplay: 'Рейс' }]
-  );
-  if (ensured.changed) {
-    maxCol = Math.max(maxCol, header.length);
-    headerKeyToIdx = ensured.headerKeyToIdx;
+  // Колонки из источников, ключи которых не покрыты каноном (например, «Тип доставки»,
+  // «Заказ в МС», «Ссылка на инвойс», «Аванс № заявки» и т.п.) — дописываем в конец заголовка,
+  // чтобы пользовательские данные не терялись. Имя берётся из первого источника, где такой
+  // ключ встретился.
+  syncManagerSummaryAppendUnknownSourceKeys_(header, headerKeys, headerKeyToIdx, sources);
+
+  let tripModeMap = {};
+  let deliveryModeMismatch = 0;
+  if (typeof logisticsLoadTripDeliveryModeMap_ === 'function' && typeof logisticsOpenBook05_ === 'function') {
+    try {
+      tripModeMap = logisticsLoadTripDeliveryModeMap_(logisticsOpenBook05_());
+    } catch (e) {
+      // Книга 05 недоступна — сборка Сводной без наследования режима.
+    }
   }
+
+  let maxCol = header.length;
 
   const row1Existing =
     summarySh.getLastRow() >= 1
@@ -397,8 +1006,10 @@ function syncManagerTabsToSummary() {
       let monthKey;
       let labelRus;
       if (kind === 'manager_month') {
-        const managerIdx =
-          headerKeyToIdx['manager'] != null ? headerKeyToIdx['manager'] : COL.MANAGER;
+        // managerIdx всегда === COL.MANAGER благодаря канонической раскладке. Доступ через
+        // headerKeyToIdx — на случай, если COL когда-нибудь поменяется: запись всё равно
+        // пойдёт в колонку с ключом 'manager', а не в случайную позицию.
+        const managerIdx = headerKeyToIdx['manager'];
         if (managerIdx != null && managerIdx < row.length) row[managerIdx] = srcEntry.meta.manager;
         monthKey = srcEntry.meta.monthKey;
         labelRus = srcEntry.meta.labelRus;
@@ -406,6 +1017,24 @@ function syncManagerTabsToSummary() {
         const histMeta = syncManagerHistoryRowMeta_(row, headerKeyToIdx);
         monthKey = histMeta.monthKey;
         labelRus = histMeta.labelRus;
+      }
+
+      const shipIdx = headerKeyToIdx['shipment_id'];
+      const modeIdx = headerKeyToIdx['delivery_mode'];
+      if (shipIdx != null && modeIdx != null && modeIdx < row.length) {
+        const sid = String(row[shipIdx] || '').trim();
+        const fromTrip = sid ? tripModeMap[sid] : '';
+        if (fromTrip) {
+          const existing = String(row[modeIdx] || '').trim();
+          if (!existing) {
+            row[modeIdx] = fromTrip;
+          } else if (
+            typeof logisticsNorm_ === 'function' &&
+            logisticsNorm_(existing) !== logisticsNorm_(fromTrip)
+          ) {
+            deliveryModeMismatch++;
+          }
+        }
       }
 
       collected.push({
@@ -465,20 +1094,110 @@ function syncManagerTabsToSummary() {
   syncManagerSummaryApplyColumnFormats_(summarySh, out.length, headerKeyToIdx);
   syncManagerSummaryApplySeparatorStyles_(summarySh, sepMask, maxCol);
 
-  ui.alert(
+  const doneMsg =
     'Сводная обновлена.\n' +
-      'Вкладок «Имя ММ/ГГ»: ' +
-      managerSheets +
-      '\nЛистов «История отгрузок*»: ' +
-      historySheets +
-      '\nСтрок данных: ' +
-      dataLines +
-      '\nРазделителей между месяцами: ' +
-      sepLines +
-      '\nКолонок: ' +
-      maxCol +
-      '.'
+    'Вкладок «Имя ММ/ГГ»: ' +
+    managerSheets +
+    '\nЛистов «История отгрузок*»: ' +
+    historySheets +
+    '\nСтрок данных: ' +
+    dataLines +
+    '\nРазделителей между месяцами: ' +
+    sepLines +
+    '\nКолонок: ' +
+    maxCol +
+    '.' +
+    (deliveryModeMismatch
+      ? '\n⚠️ Расхождение «Тип доставки» со «Рейсы» (05): ' + deliveryModeMismatch + ' строк.'
+      : '');
+  if (!silent) {
+    ui.alert(doneMsg);
+  }
+  return doneMsg;
+}
+
+/**
+ * Меню: списать выделенные строки активной вкладки в рейс (статус «4. В пути в Москву» + колонка «Рейс»).
+ */
+function assignSelectedRowsToShipment() {
+  const ui = SpreadsheetApp.getUi();
+  const ss = SpreadsheetApp.getActiveSpreadsheet();
+  const sheet = ss.getActiveSheet();
+  if (!sheet || sheet.getName() === SHEET_NAME) {
+    ui.alert('Откройте вкладку менеджера или «История отгрузок», выделите строки и повторите.');
+    return;
+  }
+  if (sheet.getLastRow() < MANAGER_SUMMARY_SYNC_DATA_START_ROW) {
+    ui.alert('На листе нет строк данных.');
+    return;
+  }
+
+  let validShipments = null;
+  if (typeof logisticsOpenBook05_ === 'function' && typeof logisticsLoadValidShipmentIds_ === 'function') {
+    try {
+      validShipments = logisticsLoadValidShipmentIds_(logisticsOpenBook05_());
+    } catch (e) {
+      ui.alert('Не удалось открыть книгу 05: ' + (e.message || String(e)));
+      return;
+    }
+  }
+
+  const pick = ui.prompt(
+    'Рейс (SHIPMENT_ID)',
+    'Введите ID рейса (например TR-2026-0011):',
+    ui.ButtonSet.OK_CANCEL
   );
+  if (pick.getSelectedButton() !== ui.Button.OK) return;
+  const shipmentId = String(pick.getResponseText() || '').trim();
+  if (!shipmentId) {
+    ui.alert('Пустой SHIPMENT_ID.');
+    return;
+  }
+  if (validShipments && !validShipments[shipmentId]) {
+    const cont = ui.alert(
+      'Рейс не найден',
+      'ID «' +
+        shipmentId +
+        '» отсутствует на листе «Рейсы» в книге 05.\nВсё равно записать в строки?',
+      ui.ButtonSet.YES_NO
+    );
+    if (cont !== ui.Button.YES) return;
+  }
+
+  const lc = sheet.getLastColumn();
+  const headerRow = MANAGER_SUMMARY_SYNC_HEADER_ROW;
+  const headerRaw = sheet.getRange(headerRow, 1, 1, lc).getValues()[0] || [];
+  const srcKeys = headerRaw.map(function (h) {
+    return syncManagerHeaderKey_(syncManagerCanonHeader_(h));
+  });
+  const srcMap = syncManagerBuildHeaderIndex_(srcKeys);
+  const idxStatus = srcMap.order_status;
+  const idxShip = srcMap.shipment_id;
+  if (idxStatus == null || idxShip == null) {
+    ui.alert('На листе нужны колонки «Статус заказа» и «Рейс» (или добавьте «Рейс» в шапку).');
+    return;
+  }
+
+  const shippedStatus =
+    typeof LOGISTICS_CFG !== 'undefined' && LOGISTICS_CFG.SHIPPED_STATUS
+      ? LOGISTICS_CFG.SHIPPED_STATUS
+      : '4. В пути в Москву';
+
+  const range = ss.getActiveRange();
+  const startRow = Math.max(range.getRow(), MANAGER_SUMMARY_SYNC_DATA_START_ROW);
+  const endRow = Math.min(range.getLastRow(), sheet.getLastRow());
+  if (endRow < startRow) {
+    ui.alert('Выделите строки данных.');
+    return;
+  }
+
+  let updated = 0;
+  for (let r = startRow; r <= endRow; r++) {
+    sheet.getRange(r, idxStatus + 1).setValue(shippedStatus);
+    sheet.getRange(r, idxShip + 1).setValue(shipmentId);
+    updated++;
+  }
+  ui.alert('Готово', 'Обновлено строк: ' + updated + '\nРейс: ' + shipmentId, ui.ButtonSet.OK);
 }
 
 /**
@@ -501,65 +1220,35 @@ function syncManagerIsHistoryShipmentsSheet_(sheetNameTrim) {
  * Заголовок берётся либо из первого источника, где такой ключ встретился, либо из defaultDisplay.
  * @returns {{ changed: boolean, headerKeyToIdx: Object }}
  */
-function syncManagerSummaryEnsureRequiredKeys_(header, headerKeys, headerKeyToIdx, sources, summarySh, required) {
-  let changed = false;
-  let i;
+/**
+ * Дополняет канонический заголовок Сводной колонками из источников, ключи которых не покрыты
+ * каноном (например, «Тип доставки», «Заказ в МС», «Аванс № заявки» и т.п.).
+ * Имя колонки берётся из первой вкладки, где такой ключ встретился. Дубликаты не добавляются.
+ *
+ * Мутирует `header`, `headerKeys`, `headerKeyToIdx` на месте.
+ */
+function syncManagerSummaryAppendUnknownSourceKeys_(header, headerKeys, headerKeyToIdx, sources) {
   let s;
-  for (i = 0; i < required.length; i++) {
-    const req = required[i];
-    if (headerKeyToIdx[req.key] != null) continue;
-
-    // Поиск display-имени в источниках
-    let display = null;
-    for (s = 0; s < sources.length; s++) {
-      const sht = sources[s].sheet;
-      const lc = sht.getLastColumn();
-      if (lc <= 0) continue;
-      const hdr =
-        sht
-          .getRange(MANAGER_SUMMARY_SYNC_HEADER_ROW, 1, 1, lc)
-          .getValues()[0] || [];
-      let j;
-      for (j = 0; j < hdr.length; j++) {
-        const cell = hdr[j];
-        const canon = syncManagerCanonHeader_(cell);
-        if (syncManagerHeaderKey_(canon) === req.key) {
-          display = String(cell);
-          break;
-        }
-      }
-      if (display) break;
+  let j;
+  for (s = 0; s < sources.length; s++) {
+    const sht = sources[s].sheet;
+    const lc = sht.getLastColumn();
+    if (lc <= 0) continue;
+    const hdr =
+      sht
+        .getRange(MANAGER_SUMMARY_SYNC_HEADER_ROW, 1, 1, lc)
+        .getValues()[0] || [];
+    for (j = 0; j < hdr.length; j++) {
+      const orig = hdr[j];
+      const canon = syncManagerCanonHeader_(orig);
+      const key = canon ? syncManagerHeaderKey_(canon) : '';
+      if (!key) continue;
+      if (headerKeyToIdx[key] != null) continue;
+      header.push(String(orig));
+      headerKeys.push(key);
+      headerKeyToIdx[key] = header.length - 1;
     }
-
-    // Запасной вариант — display из текущей Сводной (вдруг пользователь руками добавил)
-    if (!display) {
-      const lc = summarySh.getLastColumn();
-      if (lc > 0) {
-        const hdr =
-          summarySh
-            .getRange(MANAGER_SUMMARY_SYNC_HEADER_ROW, 1, 1, lc)
-            .getValues()[0] || [];
-        let j;
-        for (j = 0; j < hdr.length; j++) {
-          const cell = hdr[j];
-          const canon = syncManagerCanonHeader_(cell);
-          if (syncManagerHeaderKey_(canon) === req.key) {
-            display = String(cell);
-            break;
-          }
-        }
-      }
-    }
-
-    if (!display) display = req.defaultDisplay || req.key;
-
-    header.push(display);
-    headerKeys.push(req.key);
-    headerKeyToIdx[req.key] = header.length - 1;
-    changed = true;
   }
-
-  return { changed: changed, headerKeyToIdx: headerKeyToIdx };
 }
 
 /**
@@ -671,11 +1360,20 @@ function ensureHistoryShipmentsSheet_(ss) {
 }
 
 /**
- * Стандартная шапка листа «История отгрузок». Имена колонок выровнены под COL —
- * чтобы пользователю было привычно. Сборщик в любом случае матчит по ключам, не по позиции,
- * так что пользователь может переименовать/переставить колонки.
+ * Канонический заголовок Сводной: фиксированный порядок колонок по COL-константам, плюс
+ * служебные «Период (MM/YY)» и «Плановая дата поступления» в конце.
+ *
+ * Это единственный источник истины и для:
+ *   — целевой раскладки при сборке Сводной (`syncManagerTabsToSummary`),
+ *   — шаблона нового листа «История отгрузок» (`ensureHistoryShipmentsSheet_`).
+ *
+ * Раньше Сводная брала шапку из «самой широкой» вкладки-источника (widest). Это привязывало
+ * структуру Сводной к произвольному порядку колонок в менеджерских табах и ломало
+ * пользовательские валидации/условное форматирование, а также приводило к подмене столбцов
+ * (в «Никита 07/26» «Статус заказа» стоял на позиции H, «Менеджер» отсутствовал — имя
+ * менеджера записывалось поверх значения статуса). Канон делает раскладку устойчивой.
  */
-function syncManagerHistorySheetDefaultHeader_() {
+function syncManagerSummaryCanonicalHeader_() {
   const header = new Array(COL.SHIPMENT_ID + 1).fill('');
   header[COL.WB_ARTICLE] = 'Артикул ВБ';
   header[COL.SUPPLIER_ARTICLE] = 'Артикул поставщика';
@@ -709,11 +1407,20 @@ function syncManagerHistorySheetDefaultHeader_() {
   header[COL.MS_LINK] = 'MS_LINK';
   header[COL.STATUS] = 'Статус скрипта';
   header[COL.SHIPMENT_ID] = 'Рейс';
-  // Период (MM/YY) и ETA — отдельная колонка с правой стороны, чтобы корректно определять
+  // Период (MM/YY) и ETA — отдельные колонки с правой стороны, чтобы корректно определять
   // месяц прибытия для книги 03 (она читает period/eta/ready_date в этом приоритете).
   header.push('Период (MM/YY)');
   header.push('Плановая дата поступления');
   return header;
+}
+
+/**
+ * Шаблон листа «История отгрузок». Делегирует в канон — раскладка Сводной и шаблона
+ * исторических отгрузок гарантированно одинаковая. Пользователь может переименовать/
+ * переставить колонки в своих менеджерских вкладках — сборщик матчит по ключам.
+ */
+function syncManagerHistorySheetDefaultHeader_() {
+  return syncManagerSummaryCanonicalHeader_();
 }
 
 function syncManagerCanonHeader_(h) {
@@ -834,8 +1541,26 @@ function syncManagerHeaderKey_(canonHeader) {
 
   // Логистика
   if (h === 'дата готовности' || h === 'ready date') return 'ready_date';
-  if (h === 'отгрузка через' || h === 'доставка' || h === 'delivery type') return 'ship_via';
+  if (
+    h === 'тип доставки' ||
+    h === 'режим доставки' ||
+    h === 'delivery mode' ||
+    h === 'delivery_mode' ||
+    h === 'способ доставки'
+  ) {
+    return 'delivery_mode';
+  }
+  if (h === 'отгрузка через' || h === 'ship via' || h === 'ship_via') return 'ship_via';
+  if (h === 'доставка' && h.indexOf('тип') === -1) return 'ship_via';
   if (h === 'статус заказа' || h === 'статус' || h === 'order status' || h === 'status') return 'order_status';
+
+  if (h === 'поставщик мс' || h === 'supplier ms' || h === 'ms supplier') return 'supplier_ms';
+  if (h === 'поставщик' || h === 'supplier' || h === 'фабрика' || h === 'factory') return 'supplier_note';
+
+  if (h === 'ms id' || h === 'ms_id' || h === 'id заказа мс') return 'ms_id';
+  if (h === 'ms link' || h === 'ms_link') return 'ms_link';
+  if (h === 'статус скрипта' || h === 'script status' || h === 'статус синхронизации') return 'script_status';
+  if (h === 'заказ в мс' || h === 'заказ мс' || h === 'order in ms') return 'ms_order_sheet';
 
   // ETA / плановая дата поступления (нужно для месяца прибытия в книге 03)
   if (
@@ -925,6 +1650,7 @@ function diagnoseActiveTabHeadersForSummary() {
     volume: 'Объем',
     weight: 'Вес',
     shipment_id: 'Рейс',
+    delivery_mode: 'Тип доставки',
     period: 'Период (MM/YY)',
     eta: 'Плановая дата поступления'
   };
@@ -1267,11 +1993,12 @@ function getYuanMeta() {
   return null;
 }
 
-function buildPurchaseOrderPayload(row, supplier, positions, paymentData) {
+function buildPurchaseOrderPayload(row, supplier, positions, paymentData, sourceTabNames) {
+  const orgId = normalizeMsEntityId_(CONFIG.MS_ORGANIZATION_ID);
   const payload = {
-    organization: buildMeta('organization', CONFIG.MS_ORGANIZATION_ID),
+    organization: buildMeta('organization', orgId),
     agent: { meta: supplier.meta },
-    description: buildDescription(row),
+    description: buildDescription(row, sourceTabNames),
     positions: positions
   };
 
@@ -1290,8 +2017,14 @@ function buildPurchaseOrderPayload(row, supplier, positions, paymentData) {
 function buildMeta(type, id) { return { meta: { href: `https://api.moysklad.ru/api/remap/1.2/entity/${type}/${id}`, type: type, mediaType: 'application/json' } }; }
 function buildAttrMeta(id) { return { meta: { href: `https://api.moysklad.ru/api/remap/1.2/entity/purchaseorder/metadata/attributes/${id}`, type: 'attributemetadata', mediaType: 'application/json' } }; }
 
-function buildDescription(row) {
+function buildDescription(row, sourceTabNames) {
   const parts = [];
+  const tabs = sourceTabNames || [];
+  if (tabs.length === 1) {
+    parts.push('Вкладка (план): ' + tabs[0]);
+  } else if (tabs.length > 1) {
+    parts.push('Вкладки (план): ' + tabs.join(', '));
+  }
   if (row[COL.MANAGER]) parts.push('Менеджер: ' + row[COL.MANAGER]);
   if (row[COL.ORDER_STATUS]) parts.push('Статус из таблицы: ' + row[COL.ORDER_STATUS]);
   if (row[COL.SUPPLIER_NOTE]) parts.push('Фабрика: ' + row[COL.SUPPLIER_NOTE]);
@@ -1330,20 +2063,33 @@ function findCounterpartyByName(query) {
 }
 
 class BatchUpdater {
-  constructor(sheet, data) { this.sheet = sheet; this.numRows = data.length; this.updates = {}; }
+  constructor(sheet, data, layout) {
+    this.sheet = sheet;
+    this.numRows = data.length;
+    this.updates = {};
+    this.headerRowIdx = layout && layout.headerRowIdx != null ? layout.headerRowIdx : MANAGER_SUMMARY_SYNC_HEADER_ROW - 1;
+    this.colStatus = layout && layout.colStatus != null ? layout.colStatus : COL.STATUS;
+    this.dataStartIdx = this.headerRowIdx + 1;
+    this.dataStartSheetRow = this.headerRowIdx + 2;
+    this.headerSheetRow = this.headerRowIdx + 1;
+  }
   setValue(rowIndex, colIndex, value) {
     if (!this.updates[colIndex]) this.updates[colIndex] = new Array(this.numRows).fill('');
     this.updates[colIndex][rowIndex] = value;
   }
-  setStatus(rowIndex, text) { this.setValue(rowIndex, COL.STATUS, text); }
+  setStatus(rowIndex, text) { this.setValue(rowIndex, this.colStatus, text); }
   flush() {
-    const headerCell = this.sheet.getRange(2, COL.STATUS + 1);
+    const headerCell = this.sheet.getRange(this.headerSheetRow, this.colStatus + 1);
     if (!headerCell.getValue()) headerCell.setValue('Статус скрипта');
     for (const colIndex in this.updates) {
-      const colData = this.updates[colIndex].slice(2).map(v => [v !== '' ? v : null]);
+      const colData = this.updates[colIndex].slice(this.dataStartIdx).map(function (v) {
+        return [v !== '' ? v : null];
+      });
       if (colData.length === 0) continue;
-      const range = this.sheet.getRange(3, parseInt(colIndex) + 1, colData.length, 1);
-      const merged = range.getValues().map((row, i) => [colData[i][0] !== null ? colData[i][0] : row[0]]);
+      const range = this.sheet.getRange(this.dataStartSheetRow, parseInt(colIndex, 10) + 1, colData.length, 1);
+      const merged = range.getValues().map(function (row, i) {
+        return [colData[i][0] !== null ? colData[i][0] : row[0]];
+      });
       range.setValues(merged);
     }
   }

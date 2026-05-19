@@ -51,7 +51,15 @@ const SYNC_HUB_CFG = {
     COST_TRIP_EXPENSES_SHEET_NAME: 'Затраты рейса',
     COST_CUSTOMS_SHEET_NAME: 'Таможенные платежи',
     COST_ALLOCATION_SHEET_NAME: 'Аллокация затрат',
-    COST_SKU_SHEET_NAME: 'Себестоимость SKU'
+    COST_SKU_SHEET_NAME: 'Себестоимость SKU',
+    MASTER_REF_EXTERNAL_SPREADSHEET_ID: 'MASTER_REF_EXTERNAL_SPREADSHEET_ID',
+    MASTER_REF_EXTERNAL_PRODUCTS_SHEET: 'MASTER_REF_EXTERNAL_PRODUCTS_SHEET',
+    MASTER_REF_EXTERNAL_SUPPLIERS_SHEET: 'MASTER_REF_EXTERNAL_SUPPLIERS_SHEET'
+  },
+  EXTERNAL_DEFAULTS: {
+    SPREADSHEET_ID: '1PXWd05ENcZGvPYYbAVvf-1EPevdwkxr4IvjRbbojOlg',
+    PRODUCTS_SHEET: 'Справочник с названием товаров',
+    SUPPLIERS_SHEET: 'Справочник поставщики и условия'
   }
 };
 
@@ -75,6 +83,16 @@ function addSyncHubMenu_(ui) {
         .addSeparator()
         .addItem('Dry-run: Сводная 01→03', 'syncOperationalOrdersSummaryFrom01To03DryRun_')
         .addItem('Сводная 01→03 (боевой)', 'syncOperationalOrdersSummaryFrom01To03WithConfirm_')
+    )
+    .addSubMenu(
+      ui
+        .createMenu('⏱ Расписание')
+        .addItem('Установить триггеры этой книги (04)', 'gremlinScheduleInstallTriggers04_')
+        .addItem('Снять триггеры этой книги', 'gremlinScheduleRemoveTriggers_')
+        .addSeparator()
+        .addItem('Сейчас: справочники (внешние → 04 → 01)', 'gremlinScheduleRunHourlyRefsNow_')
+        .addItem('Сейчас: Сводная 01→02 и 03', 'gremlinScheduleRunHourlySnapshotsNow_')
+        .addItem('Сейчас: полный hourly-цикл 04', 'gremlinScheduleRunHourlyFull04Now_')
     )
     .addToUi();
 }
@@ -104,18 +122,45 @@ function syncRestoreFullProductsTo04DryRun_() {
   return syncRestoreFullProductsTo04_(true);
 }
 
+function syncHubGetExternalRefConfig_() {
+  return {
+    spreadsheetId: syncHubGetProp_(
+      SYNC_HUB_CFG.PROPS.MASTER_REF_EXTERNAL_SPREADSHEET_ID,
+      SYNC_HUB_CFG.EXTERNAL_DEFAULTS.SPREADSHEET_ID
+    ),
+    productsSheet: syncHubGetProp_(
+      SYNC_HUB_CFG.PROPS.MASTER_REF_EXTERNAL_PRODUCTS_SHEET,
+      SYNC_HUB_CFG.EXTERNAL_DEFAULTS.PRODUCTS_SHEET
+    ),
+    suppliersSheet: syncHubGetProp_(
+      SYNC_HUB_CFG.PROPS.MASTER_REF_EXTERNAL_SUPPLIERS_SHEET,
+      SYNC_HUB_CFG.EXTERNAL_DEFAULTS.SUPPLIERS_SHEET
+    )
+  };
+}
+
 function syncRestoreFullProductsTo04_(dryRun) {
-  const SOURCE_SPREADSHEET_ID = '1PXWd05ENcZGvPYYbAVvf-1EPevdwkxr4IvjRbbojOlg';
-  const SOURCE_SHEET_NAME = 'Справочник с названием товаров';
+  return syncRestoreProductsFromExternal_(dryRun);
+}
+
+/**
+ * Товары: внешняя книга → «Справочник товары» в 04.
+ */
+function syncRestoreProductsFromExternal_(dryRun) {
+  const cfg = syncHubGetExternalRefConfig_();
   try {
-    const sourceSs = SpreadsheetApp.openById(SOURCE_SPREADSHEET_ID);
+    const sourceSs = SpreadsheetApp.openById(cfg.spreadsheetId);
     const targetSs = syncHubOpenSpreadsheetForBook_('04');
+    const targetName = syncHubGetProp_(
+      SYNC_HUB_CFG.PROPS.MASTER_PRODUCTS_SHEET_NAME,
+      SYNC_HUB_CFG.DEFAULTS.MASTER_PRODUCTS_SHEET_NAME
+    );
     const mappings = [
       {
-        source: SOURCE_SHEET_NAME,
-        sourceAliases: [SOURCE_SHEET_NAME],
-        target: syncHubGetProp_(SYNC_HUB_CFG.PROPS.MASTER_PRODUCTS_SHEET_NAME, SYNC_HUB_CFG.DEFAULTS.MASTER_PRODUCTS_SHEET_NAME),
-        targetAliases: [SYNC_HUB_CFG.DEFAULTS.MASTER_PRODUCTS_SHEET_NAME],
+        source: cfg.productsSheet,
+        sourceAliases: [cfg.productsSheet, SYNC_HUB_CFG.EXTERNAL_DEFAULTS.PRODUCTS_SHEET],
+        target: targetName,
+        targetAliases: [SYNC_HUB_CFG.DEFAULTS.MASTER_PRODUCTS_SHEET_NAME, 'Справочник товары'],
         required: true
       }
     ];
@@ -130,6 +175,64 @@ function syncRestoreFullProductsTo04_(dryRun) {
     syncHubLog_('RESTORE 04 Товары', 'ERROR', e.message || String(e), !!dryRun);
     throw e;
   }
+}
+
+/**
+ * Поставщики: внешняя книга → «Справочник поставщики и условия» в 04.
+ */
+function syncRestoreSuppliersFromExternal_(dryRun) {
+  const cfg = syncHubGetExternalRefConfig_();
+  const suppliersSheet = String(cfg.suppliersSheet || '').trim();
+  if (!suppliersSheet || suppliersSheet.toLowerCase() === 'off') {
+    const msg = 'Пропуск поставщиков (MASTER_REF_EXTERNAL_SUPPLIERS_SHEET пуст или OFF)';
+    syncHubLog_('RESTORE 04 Поставщики', 'SKIP', msg, !!dryRun);
+    return msg;
+  }
+  try {
+    const sourceSs = SpreadsheetApp.openById(cfg.spreadsheetId);
+    const targetSs = syncHubOpenSpreadsheetForBook_('04');
+    const targetName = syncHubGetProp_(
+      SYNC_HUB_CFG.PROPS.MASTER_SUPPLIERS_SHEET_NAME,
+      SYNC_HUB_CFG.DEFAULTS.MASTER_SUPPLIERS_SHEET_NAME
+    );
+    const mappings = [
+      {
+        source: suppliersSheet,
+        sourceAliases: [
+          suppliersSheet,
+          'Справочник поставщики и условия',
+          'Справочник поставщики и условия работы'
+        ],
+        target: targetName,
+        targetAliases: [
+          SYNC_HUB_CFG.DEFAULTS.MASTER_SUPPLIERS_SHEET_NAME,
+          'Справочник поставщики и условия',
+          'Справочник поставщики и условия работы'
+        ],
+        required: true
+      }
+    ];
+    const stats = syncHubCopyMappings_(sourceSs, targetSs, mappings, {
+      dryRun: !!dryRun,
+      createMissingTarget: true
+    });
+    const msg = 'Восстановление поставщиков в 04: ' + stats;
+    syncHubLog_('RESTORE 04 Поставщики', 'OK', msg, !!dryRun);
+    return msg;
+  } catch (e) {
+    syncHubLog_('RESTORE 04 Поставщики', 'ERROR', e.message || String(e), !!dryRun);
+    throw e;
+  }
+}
+
+/**
+ * Импорт товаров и поставщиков из внешней книги в 04 (для расписания и пакетных прогонов).
+ */
+function syncRestoreMasterRefsFromExternalImpl_(dryRun, opt) {
+  const parts = [];
+  parts.push(syncRestoreProductsFromExternal_(dryRun));
+  parts.push(syncRestoreSuppliersFromExternal_(dryRun));
+  return parts.join('\n');
 }
 
 function syncHubHealthCheck() {
@@ -270,7 +373,8 @@ function syncAllExternalBooksWithConfirm_() {
   syncAllExternalBooks_();
 }
 
-function syncAllExternalBooksImpl_(dryRun) {
+function syncAllExternalBooksImpl_(dryRun, opt) {
+  const silent = !!(opt && opt.silent);
   const lock = LockService.getScriptLock();
   const lockTimeoutMs = syncHubGetNumberProp_(
     SYNC_HUB_CFG.PROPS.SYNC_LOCK_TIMEOUT_MS,
@@ -282,11 +386,13 @@ function syncAllExternalBooksImpl_(dryRun) {
     report.push(syncMasterRefsFrom04_(dryRun, { silent: true }));
     report.push(syncStatusRefFrom04ToBooks_(dryRun));
     report.push(syncCollectRefsTo04From05_(dryRun));
-    SpreadsheetApp.getUi().alert(
-      dryRun ? '🧪 Dry-run завершен' : '✅ Синхронизация завершена',
-      report.join('\n'),
-      SpreadsheetApp.getUi().ButtonSet.OK
-    );
+    if (!silent) {
+      SpreadsheetApp.getUi().alert(
+        dryRun ? '🧪 Dry-run завершен' : '✅ Синхронизация завершена',
+        report.join('\n'),
+        SpreadsheetApp.getUi().ButtonSet.OK
+      );
+    }
     return report.join('\n');
   } finally {
     lock.releaseLock();
@@ -337,7 +443,8 @@ function syncOperationalOrdersSummaryFrom01To03WithConfirm_() {
   syncOperationalOrdersSummaryFrom01To03_(false, {});
 }
 
-function syncOperationalSnapshotsImpl_(dryRun) {
+function syncOperationalSnapshotsImpl_(dryRun, opt) {
+  const silent = !!(opt && opt.silent);
   const lock = LockService.getScriptLock();
   const lockTimeoutMs = syncHubGetNumberProp_(
     SYNC_HUB_CFG.PROPS.SYNC_LOCK_TIMEOUT_MS,
@@ -348,11 +455,13 @@ function syncOperationalSnapshotsImpl_(dryRun) {
     const report = [];
     report.push(syncOperationalOrdersSummaryFrom01To02_(dryRun, { silent: true }));
     report.push(syncOperationalOrdersSummaryFrom01To03_(dryRun, { silent: true }));
-    SpreadsheetApp.getUi().alert(
-      dryRun ? '🧪 Dry-run операционные снимки' : '✅ Операционные снимки готовы',
-      report.join('\n'),
-      SpreadsheetApp.getUi().ButtonSet.OK
-    );
+    if (!silent) {
+      SpreadsheetApp.getUi().alert(
+        dryRun ? '🧪 Dry-run операционные снимки' : '✅ Операционные снимки готовы',
+        report.join('\n'),
+        SpreadsheetApp.getUi().ButtonSet.OK
+      );
+    }
     return report.join('\n');
   } finally {
     lock.releaseLock();
@@ -581,6 +690,13 @@ function syncCollectRefsTo04From05_(dryRun) {
         sourceAliases: ['Типы событий'],
         target: 'Типы_событий',
         targetAliases: ['Типы_событий', 'Типы событий'],
+        required: false
+      },
+      {
+        source: 'Нормативы_доставки',
+        sourceAliases: ['Нормативы доставки'],
+        target: 'Нормативы_доставки',
+        targetAliases: ['Нормативы_доставки', 'Нормативы доставки'],
         required: false
       }
     ];

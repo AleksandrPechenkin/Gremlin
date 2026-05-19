@@ -3,6 +3,11 @@ Thumbs.db
 Desktop.ini
 *.log
 .DS_Store
+__pycache__/
+*.pyc
+
+# Логи ежедневного push на GitHub
+scripts/logs/
 
 # Если позже появится clasp (не коммитить секреты в публичный репозиторий)
 .clasp.json

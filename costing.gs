@@ -26,8 +26,21 @@ const COST_CFG = {
     COST_SKU: 'Себестоимость SKU',
     CUSTOMS_FEE_RATES: 'Справочник_таможсбор',
     PRODUCTS_REF: 'Справочник товаров (05)',
-    SUPPLIERS_REF: 'Справочник поставщики и условия'
-  }
+    SUPPLIERS_REF: 'Справочник поставщики и условия',
+    DECL_LINES: 'Декларации_строки',
+    DECL_JOURNAL: 'Декларации_журнал',
+    COST_SKU_FACT: 'Факт_себестоимость SKU'
+  },
+  DECL_LINES_HEADER: [
+    'Загрузка_ID', 'Загрузка_время', 'SHIPMENT_ID', 'Номер_ГТД', 'Дата_ГТД',
+    '№_строки', 'Код_ТНВЭД', 'Описание', 'Qty', 'Вес_нетто', 'Валюта',
+    'Таможенная_стоимость', 'Пошлина', 'НДС', 'Сбор', 'Итого_платежи',
+    'Артикул_ВБ', 'Статус_сопоставления', 'Комментарий'
+  ],
+  DECL_JOURNAL_HEADER: [
+    'Загрузка_ID', 'Загрузка_время', 'SHIPMENT_ID', 'Имя_файла', 'Пресет',
+    'Строк_товаров', 'Пошлина_итого', 'НДС_итого', 'Сбор_итого', 'Предупреждения'
+  ]
 };
 
 function addCostingMenu_(ui) {
@@ -55,6 +68,13 @@ function addCostingMenu_(ui) {
     .addSubMenu(batchesMenu)
     .addSeparator()
     .addItem('🛠 Подставить курсы ЦБ в пустые Курс_к_RUB', 'costingFillEmptyFxRatesMenu_')
+    .addSeparator()
+    .addItem('Загрузить декларацию (XML)', 'costingCustomsXmlOpenUploadDialog_')
+    .addItem('🔗 Сопоставить строки декларации с SKU', 'costingMatchDeclarationPrompt_')
+    .addSeparator()
+    .addItem('🧪 Dry-run факт (по рейсу)', 'costingDryRunFactPrompt_')
+    .addItem('✅ Пересчитать фактическую себестоимость', 'rebuildCostingFact_')
+    .addItem('📊 Сверка план vs факт', 'costingComparePlanFactPrompt_')
     .addSeparator()
     .addItem('Создать недостающие листы', 'costingEnsureSheets_')
     .addToUi();
@@ -94,6 +114,10 @@ function costingEnsureSheets_() {
       created++;
     }
   });
+  costingEnsureDeclLinesSheet_(ss);
+  costingEnsureDeclJournalSheet_(ss);
+  costingEnsureCustomsFactColumns_(ss);
+  costingEnsureFactCostSkuHeader_(ss);
   SpreadsheetApp.getUi().alert(
     'Готово',
     created ? ('Создано листов: ' + created) : 'Все обязательные листы уже существуют.',
@@ -422,7 +446,10 @@ function costingBuildSkuCostRows_(shipmentFilter) {
   };
 }
 
-function costingBuildSkuCostRowsFromBatchesAndExpenses_(ss, shipmentFilter) {
+function costingBuildSkuCostRowsFromBatchesAndExpenses_(ss, shipmentFilter, options) {
+  options = options || {};
+  const scenarioMode = String(options.scenarioMode || 'PLAN').toUpperCase();
+  const isFact = scenarioMode === 'FACT';
   const batchesSh = costingGetSheetByRole_(ss, 'BATCHES');
   const expensesSh = costingGetSheetByRole_(ss, 'TRIP_EXPENSES');
   const batchesData = batchesSh.getDataRange().getValues();
@@ -472,7 +499,10 @@ function costingBuildSkuCostRowsFromBatchesAndExpenses_(ss, shipmentFilter) {
       const shipmentId = String(r[eShipment] || '').trim();
       if (!shipmentId) continue;
       if (shipmentFilter && shipmentId !== shipmentFilter) continue;
-      if (eScenario != null && String(r[eScenario] || '').trim().toUpperCase() === 'FACT') continue;
+      if (eScenario != null) {
+        const sc = String(r[eScenario] || '').trim().toUpperCase();
+        if (isFact ? sc !== 'FACT' : sc === 'FACT') continue;
+      }
       const sumRub = eSumRub != null ? costingToNumber_(r[eSumRub]) : costingToNumber_(r[eSum]);
       if (!sumRub) continue;
       const article = costingCellText_(r, costingFindColOptional_(eh, ['Статья_затрат', 'Статья затрат', 'Статья']));
@@ -525,25 +555,24 @@ function costingBuildSkuCostRowsFromBatchesAndExpenses_(ss, shipmentFilter) {
     }
   }
 
-  // Дополняем пулы таможенными значениями из отдельного листа "Таможенный_расчет".
-  // Исторически эти суммы делились по QTY — оставляем то же поведение и явно помечаем базу как QTY,
-  // чтобы аллокация работала единообразно.
-  const customsPoolsByShipment = costingLoadCustomsPoolsByShipment_(ss, shipmentFilter);
-  const customsPoolKeys = Object.keys(customsPoolsByShipment);
-  for (let i = 0; i < customsPoolKeys.length; i++) {
-    const shipmentId = customsPoolKeys[i];
-    if (!expensePoolsByShipment[shipmentId]) {
-      expensePoolsByShipment[shipmentId] = costingMakeEmptyExpensePool_();
+  // Плановый контур: агрегат таможни по рейсу (без FACT). Факт — по SKU из «Таможенные платежи» ниже.
+  if (!isFact) {
+    const customsPoolsByShipment = costingLoadCustomsPoolsByShipment_(ss, shipmentFilter, 'PLAN');
+    const customsPoolKeys = Object.keys(customsPoolsByShipment);
+    for (let i = 0; i < customsPoolKeys.length; i++) {
+      const shipmentId = customsPoolKeys[i];
+      if (!expensePoolsByShipment[shipmentId]) {
+        expensePoolsByShipment[shipmentId] = costingMakeEmptyExpensePool_();
+      }
+      const target = expensePoolsByShipment[shipmentId];
+      const src = customsPoolsByShipment[shipmentId];
+      if (src.dutyRub) costingAddToBaseMap_(target.dutyRub, 'QTY', src.dutyRub);
+      if (src.vatRub) costingAddToBaseMap_(target.vatRub, 'QTY', src.vatRub);
+      if (src.dutyRub || src.vatRub) {
+        if (!baseUsageByShipment[shipmentId]) baseUsageByShipment[shipmentId] = {};
+        baseUsageByShipment[shipmentId].QTY = true;
+      }
     }
-    const target = expensePoolsByShipment[shipmentId];
-    const src = customsPoolsByShipment[shipmentId];
-    if (src.dutyRub) costingAddToBaseMap_(target.dutyRub, 'QTY', src.dutyRub);
-    if (src.vatRub) costingAddToBaseMap_(target.vatRub, 'QTY', src.vatRub);
-    if (src.dutyRub || src.vatRub) {
-      if (!baseUsageByShipment[shipmentId]) baseUsageByShipment[shipmentId] = {};
-      baseUsageByShipment[shipmentId].QTY = true;
-    }
-    // Таможенный сбор считаем по справочнику "Справочник_таможсбор" (ниже), не подмешиваем сюда.
   }
 
   const rows = [];
@@ -604,6 +633,7 @@ function costingBuildSkuCostRowsFromBatchesAndExpenses_(ss, shipmentFilter) {
     // - весовая: пошлина = ставка(EUR/ед) * количество * курс EUR
     // В текущей модели "таможенная стоимость" = закупка_руб по строке партии.
     let dutyRub = 0;
+    if (!isFact) {
     if (dutyType.indexOf('стоимост') !== -1) {
       dutyRub = purchaseRub * dutyRate;
     } else if (dutyType.indexOf('весов') !== -1) {
@@ -623,6 +653,7 @@ function costingBuildSkuCostRowsFromBatchesAndExpenses_(ss, shipmentFilter) {
     } else {
       // fallback: если тип не заполнен, трактуем ставку как стоимостную.
       dutyRub = purchaseRub * dutyRate;
+    }
     }
 
     const volume = idxVolume != null ? costingToNumber_(r[idxVolume]) : 0;
@@ -763,10 +794,13 @@ function costingBuildSkuCostRowsFromBatchesAndExpenses_(ss, shipmentFilter) {
     const keys = Object.keys(bySupplier);
     for (let k = 0; k < keys.length; k++) {
       const supplierKey = keys[k];
-      bySupplier[supplierKey].customsFeeRub = costingResolveCustomsFeeRub_(bySupplier[supplierKey].customsBaseRub, customsFeeRules);
+      if (!isFact) {
+        bySupplier[supplierKey].customsFeeRub = costingResolveCustomsFeeRub_(bySupplier[supplierKey].customsBaseRub, customsFeeRules);
+      }
     }
   }
 
+  const customsFactBySku = isFact ? costingLoadCustomsFactByShipmentSku_(ss, shipmentFilter) : null;
   const now = new Date();
   for (let i = 0; i < staged.length; i++) {
     const x = staged[i];
@@ -789,10 +823,20 @@ function costingBuildSkuCostRowsFromBatchesAndExpenses_(ss, shipmentFilter) {
     const supShare = supAgg
       ? (supAgg.volume > 0 ? (x.volume / supAgg.volume) : (supAgg.qty > 0 ? (x.qty / supAgg.qty) : 0))
       : 0;
-    const customsFeeRub = supAgg ? (supAgg.customsFeeRub * supShare) : 0;
-    const dutyRub = x.dutyRub + dutyFromExpensesRub;
-    const vatFromRateRub = (customsBaseRub + dutyRub) * x.vatRate;
-    const vatRub = vatFromRateRub + vatFromExpensesRub;
+    let customsFeeRub;
+    let dutyRub;
+    let vatRub;
+    if (isFact) {
+      const fc = customsFactBySku && customsFactBySku[x.shipmentId] && customsFactBySku[x.shipmentId][x.sku];
+      customsFeeRub = fc ? fc.fee : 0;
+      dutyRub = (fc ? fc.duty : 0) + dutyFromExpensesRub;
+      vatRub = (fc ? fc.vat : 0) + vatFromExpensesRub;
+    } else {
+      customsFeeRub = supAgg ? (supAgg.customsFeeRub * supShare) : 0;
+      dutyRub = x.dutyRub + dutyFromExpensesRub;
+      const vatFromRateRub = (customsBaseRub + dutyRub) * x.vatRate;
+      vatRub = vatFromRateRub + vatFromExpensesRub;
+    }
     const articleBreakdown = {};
     costingPoolArticleAlloc_(poolGlobal.otherByArticle, sg, articleBreakdown);
     costingPoolArticleAlloc_(poolScoped.otherByArticle, sc, articleBreakdown);
@@ -906,7 +950,390 @@ function costingLoadSkuToTnvedMap_(ss) {
 }
 
 function costingNormalizeTnved_(v) {
-  return String(v == null ? '' : v).replace(/[^\d]/g, '');
+  if (v == null || v === '') return '';
+  if (typeof v === 'number' && isFinite(v)) {
+    const n = Math.round(v);
+    if (n > 0) return String(n);
+  }
+  let s = String(v).trim();
+  if (/e/i.test(s)) {
+    const n = Number(s.replace(',', '.'));
+    if (isFinite(n) && n > 0) return String(Math.round(n));
+  }
+  return s.replace(/[^\d]/g, '');
+}
+
+function costingTnvedFromCells_(value, displayValue) {
+  const fromDisplay = costingNormalizeTnved_(displayValue);
+  if (fromDisplay.length >= 8) return fromDisplay;
+  return costingNormalizeTnved_(value);
+}
+
+function costingTnvedCodesMatch_(a, b) {
+  if (!a || !b) return false;
+  if (a === b) return true;
+  if (a.indexOf(b) === 0 || b.indexOf(a) === 0) return true;
+  const len = Math.min(a.length, b.length, 10);
+  return len >= 8 && a.slice(0, len) === b.slice(0, len);
+}
+
+/** Первые N цифр ТН ВЭД (для группировки субкодов в декларации). */
+function costingTnvedHeading_(code, digits) {
+  const d = digits == null ? 6 : digits;
+  const c = costingNormalizeTnved_(code);
+  if (!c) return '';
+  return c.slice(0, Math.min(d, c.length));
+}
+
+/**
+ * Коды ТН ВЭД партии для сопоставления с декларацией.
+ * Справочник товаров приоритетнее колонки в «Партии_в_рейсе» (там часто устаревший код).
+ */
+function costingBatchTnvedsForDeclMatch_(batchValue, batchDisplay, sku, skuToTnved) {
+  const fromRef = sku && skuToTnved[sku] ? costingNormalizeTnved_(skuToTnved[sku]) : '';
+  const fromBatch = costingTnvedFromCells_(batchValue, batchDisplay);
+  const out = [];
+  if (fromRef) out.push(fromRef);
+  if (fromBatch && out.indexOf(fromBatch) === -1) out.push(fromBatch);
+  return out;
+}
+
+/* ===================== Декларации / фактическая себестоимость ===================== */
+
+function costingEnsureDeclLinesHeaderColumns_(sh) {
+  const header = COST_CFG.DECL_LINES_HEADER;
+  if (sh.getLastRow() < 1) return;
+  const ncol = Math.max(sh.getLastColumn(), 1);
+  const row1 = sh.getRange(1, 1, 1, ncol).getValues()[0];
+  const norm = row1.map(costingHeaderCanonForLookup_);
+  const hasUpload = norm.indexOf(costingHeaderCanonForLookup_('Загрузка_ID')) !== -1;
+  if (!hasUpload) return;
+  for (let i = 0; i < header.length; i++) {
+    const key = costingHeaderCanonForLookup_(header[i]);
+    if (norm.indexOf(key) !== -1) continue;
+    const newCol = sh.getLastColumn() + 1;
+    sh.getRange(1, newCol).setValue(header[i]);
+    norm.push(key);
+  }
+}
+
+function costingEnsureDeclLinesSheet_(ss) {
+  let sh = costingFindSheetByRole_(ss, 'DECL_LINES');
+  if (!sh) sh = ss.insertSheet(COST_CFG.SHEETS.DECL_LINES);
+  const header = COST_CFG.DECL_LINES_HEADER;
+  const a1 = sh.getRange(1, 1).getValue();
+  const a1c = costingHeaderCanonForLookup_(a1);
+  const okFirst =
+    a1c === costingHeaderCanonForLookup_('Загрузка_ID') ||
+    a1c === costingHeaderCanonForLookup_('ID');
+  if (!okFirst) {
+    sh.clear();
+    sh.getRange(1, 1, 1, header.length).setValues([header]);
+    sh.getRange(1, 1, 1, header.length).setFontWeight('bold');
+  } else {
+    costingEnsureDeclLinesHeaderColumns_(sh);
+  }
+  return sh;
+}
+
+function costingEnsureDeclJournalSheet_(ss) {
+  let sh = costingFindSheetByRole_(ss, 'DECL_JOURNAL');
+  if (!sh) sh = ss.insertSheet(COST_CFG.SHEETS.DECL_JOURNAL);
+  const header = COST_CFG.DECL_JOURNAL_HEADER;
+  const a1c = costingHeaderCanonForLookup_(sh.getLastRow() < 1 ? '' : sh.getRange(1, 1).getValue());
+  const okJournalFirst =
+    a1c === costingHeaderCanonForLookup_('Загрузка_ID') ||
+    a1c === costingHeaderCanonForLookup_('ID');
+  if (sh.getLastRow() < 1 || !okJournalFirst) {
+    sh.clear();
+    sh.getRange(1, 1, 1, header.length).setValues([header]);
+    sh.getRange(1, 1, 1, header.length).setFontWeight('bold');
+    return sh;
+  }
+  const hRow = sh.getRange(1, 1, 1, Math.max(sh.getLastColumn(), header.length)).getValues()[0];
+  if (costingFindColOptional_(hRow, ['Сбор_итого', 'Сбор итого', 'Сбор_итог', 'Сбор итог']) == null) {
+    const warnCol = costingFindColOptional_(hRow, ['Предупреждения']);
+    const insertAt = warnCol != null ? warnCol + 2 : 9;
+    sh.insertColumnBefore(insertAt);
+    sh.getRange(1, insertAt).setValue('Сбор_итого');
+    if (warnCol != null && sh.getLastRow() > 1) {
+      const lastRow = sh.getLastRow();
+      const warnVals = sh.getRange(2, warnCol + 1, lastRow, warnCol + 1).getValues();
+      const feeVals = [];
+      for (let r = 0; r < warnVals.length; r++) {
+        const v = warnVals[r][0];
+        const n = costingToNumber_(v);
+        const s = String(v || '');
+        feeVals.push([n > 50 && s.indexOf(';') < 0 && s.indexOf('Тамож') < 0 ? n : '']);
+      }
+      sh.getRange(2, insertAt, lastRow, insertAt).setValues(feeVals);
+    }
+  }
+  return sh;
+}
+
+function costingEnsureCustomsFactColumns_(ss) {
+  const sh = costingGetSheetByRole_(ss, 'CUSTOMS');
+  const data = sh.getDataRange().getValues();
+  const header = data.length ? data[0].slice() : ['SHIPMENT_ID'];
+  const hmap = costingHeaderMap_(header);
+  costingEnsureHeaderColumn_(sh, hmap, 'SHIPMENT_ID');
+  costingEnsureHeaderColumn_(sh, hmap, 'Артикул_ВБ');
+  costingEnsureHeaderColumn_(sh, hmap, 'Код_ТНВЭД');
+  costingEnsureHeaderColumn_(sh, hmap, 'Сценарий');
+  costingEnsureHeaderColumn_(sh, hmap, 'Источник');
+  costingEnsureHeaderColumn_(sh, hmap, 'Номер_ГТД');
+  costingEnsureHeaderColumn_(sh, hmap, 'Загрузка_ID');
+  costingEnsureHeaderColumn_(sh, hmap, 'Пошлина_RUB');
+  costingEnsureHeaderColumn_(sh, hmap, 'НДС_RUB');
+  costingEnsureHeaderColumn_(sh, hmap, 'Таможенный_сбор_RUB');
+}
+
+function costingEnsureFactCostSkuHeader_(ss) {
+  let sh = costingFindSheetByRole_(ss, 'COST_SKU_FACT');
+  if (!sh) sh = ss.insertSheet(COST_CFG.SHEETS.COST_SKU_FACT);
+  if (sh.getLastRow() < 1) {
+    const header = costingBuildFactOutputHeader_([]);
+    sh.getRange(1, 1, 1, header.length).setValues([header]);
+    sh.getRange(1, 1, 1, header.length).setFontWeight('bold');
+  }
+  return sh;
+}
+
+function costingLoadCustomsFactByShipmentSku_(ss, shipmentFilter) {
+  const sh = costingFindSheetByRole_(ss, 'CUSTOMS');
+  if (!sh || sh.getLastRow() < 2) return {};
+  const data = sh.getDataRange().getValues();
+  const h = data[0];
+  const idxShipment = costingFindColOptional_(h, ['SHIPMENT_ID', 'ID_рейса']);
+  const idxSku = costingFindColOptional_(h, ['Артикул_ВБ', 'Артикул ВБ', 'WB_ARTICLE', 'Артикул']);
+  const idxScenario = costingFindColOptional_(h, ['Сценарий']);
+  const idxDuty = costingFindColOptional_(h, ['Пошлина_RUB', 'Пошлина RUB', 'Пошлина']);
+  const idxVat = costingFindColOptional_(h, ['НДС_RUB', 'НДС RUB', 'НДС']);
+  const idxFee = costingFindColOptional_(h, ['Таможенный_сбор_RUB', 'Таможенный сбор RUB', 'Таможенный сбор']);
+  if (idxShipment == null || idxSku == null) return {};
+  const out = {};
+  for (let i = 1; i < data.length; i++) {
+    const r = data[i];
+    if (idxScenario != null && String(r[idxScenario] || '').trim().toUpperCase() !== 'FACT') continue;
+    const shipmentId = String(r[idxShipment] || '').trim();
+    const sku = String(r[idxSku] || '').trim();
+    if (!shipmentId || !sku) continue;
+    if (shipmentFilter && shipmentId !== shipmentFilter) continue;
+    if (!out[shipmentId]) out[shipmentId] = {};
+    if (!out[shipmentId][sku]) out[shipmentId][sku] = { duty: 0, vat: 0, fee: 0 };
+    const cell = out[shipmentId][sku];
+    cell.duty += idxDuty != null ? costingToNumber_(r[idxDuty]) : 0;
+    cell.vat += idxVat != null ? costingToNumber_(r[idxVat]) : 0;
+    cell.fee += idxFee != null ? costingToNumber_(r[idxFee]) : 0;
+  }
+  return out;
+}
+
+function costingBuildFactOutputHeader_(extraCols) {
+  return costingBuildFullOutputHeader_(extraCols || []).concat([
+    'Пошлина_план_RUB',
+    'НДС_план_RUB',
+    'Сценарий'
+  ]);
+}
+
+function costingMergePlanDutyVatIntoFactRows_(factRows, planRows) {
+  const planMap = {};
+  for (let i = 0; i < planRows.length; i++) {
+    const r = planRows[i];
+    const key = String(r[1] || '').trim() + '\t' + String(r[2] || '').trim();
+    planMap[key] = { duty: costingToNumber_(r[11]), vat: costingToNumber_(r[12]) };
+  }
+  return factRows.map(function (r) {
+    const key = String(r[1] || '').trim() + '\t' + String(r[2] || '').trim();
+    const p = planMap[key] || { duty: 0, vat: 0 };
+    return r.concat([p.duty, p.vat, 'FACT']);
+  });
+}
+
+function costingBuildSkuCostRowsFact_(shipmentFilter) {
+  const ss = SpreadsheetApp.getActiveSpreadsheet();
+  const planReport = costingBuildSkuCostRowsFromBatchesAndExpenses_(ss, shipmentFilter, { scenarioMode: 'PLAN' });
+  const factReport = costingBuildSkuCostRowsFromBatchesAndExpenses_(ss, shipmentFilter, { scenarioMode: 'FACT' });
+  const rows = costingMergePlanDutyVatIntoFactRows_(factReport.rows, planReport.rows);
+  return {
+    rows: rows,
+    skuCount: factReport.skuCount,
+    shipmentCount: factReport.shipmentCount,
+    additionalExpenseColumns: factReport.additionalExpenseColumns,
+    planReport: planReport
+  };
+}
+
+function costingDryRunFactPrompt_() {
+  const ui = SpreadsheetApp.getUi();
+  const res = ui.prompt(
+    'Dry-run факт',
+    'Введите SHIPMENT_ID (пусто = все рейсы):',
+    ui.ButtonSet.OK_CANCEL
+  );
+  if (res.getSelectedButton() !== ui.Button.OK) return;
+  const shipmentId = String(res.getResponseText() || '').trim();
+  try {
+    costingHealthCheckCore_();
+    costingEnsureCustomsFactColumns_(SpreadsheetApp.getActiveSpreadsheet());
+    const report = costingBuildSkuCostRowsFact_(shipmentId || null);
+    const compare = costingBuildPlanFactCompareFromReport_(report, shipmentId || null);
+    ui.alert(
+      '🧪 Dry-run факт',
+      'Строк: ' + report.rows.length + '\nSKU: ' + report.skuCount + '\n\n' + compare,
+      ui.ButtonSet.OK
+    );
+  } catch (e) {
+    ui.alert('❌ Dry-run факт', e.message || String(e), ui.ButtonSet.OK);
+    throw e;
+  }
+}
+
+function rebuildCostingFact_() {
+  const ui = SpreadsheetApp.getUi();
+  const res = ui.prompt(
+    'Фактическая себестоимость',
+    'Введите SHIPMENT_ID для точечного пересчёта или оставьте пустым для всей базы:',
+    ui.ButtonSet.OK_CANCEL
+  );
+  if (res.getSelectedButton() !== ui.Button.OK) return;
+  const shipmentId = String(res.getResponseText() || '').trim();
+  if (shipmentId) {
+    rebuildCostingFactByShipment_(shipmentId);
+    return;
+  }
+  try {
+    costingHealthCheckCore_();
+    const ss = SpreadsheetApp.getActiveSpreadsheet();
+    costingEnsureCustomsFactColumns_(ss);
+    costingEnsureFactCostSkuHeader_(ss);
+    const report = costingBuildSkuCostRowsFact_(null);
+    const sh = costingGetSheetByRole_(ss, 'COST_SKU_FACT');
+    const extraCols = report.additionalExpenseColumns || [];
+    const header = [costingBuildFactOutputHeader_(extraCols)];
+    sh.clearContents();
+    sh.getRange(1, 1, 1, header[0].length).setValues(header);
+    if (report.rows.length) {
+      sh.getRange(2, 1, report.rows.length + 1, header[0].length).setValues(report.rows);
+    }
+    ui.alert(
+      '✅ Фактический пересчёт завершён',
+      'Записано строк: ' + report.rows.length + '\nSKU: ' + report.skuCount,
+      ui.ButtonSet.OK
+    );
+  } catch (e) {
+    ui.alert('❌ Ошибка фактического пересчёта', e.message || String(e), ui.ButtonSet.OK);
+    throw e;
+  }
+}
+
+function rebuildCostingFactByShipment_(shipmentId) {
+  const id = String(shipmentId || '').trim();
+  if (!id) throw new Error('SHIPMENT_ID не указан.');
+  costingHealthCheckCore_();
+  const ss = SpreadsheetApp.getActiveSpreadsheet();
+  costingEnsureCustomsFactColumns_(ss);
+  costingEnsureFactCostSkuHeader_(ss);
+  const report = costingBuildSkuCostRowsFact_(id);
+  const sh = costingGetSheetByRole_(ss, 'COST_SKU_FACT');
+  const targetHeader = costingBuildFactOutputHeader_(report.additionalExpenseColumns || []);
+  costingUpsertShipmentRowsToCostSku_(sh, id, report.rows, targetHeader);
+  SpreadsheetApp.getUi().alert(
+    '✅ Факт по рейсу',
+    'SHIPMENT_ID: ' + id + '\nОбновлено строк: ' + report.rows.length,
+    SpreadsheetApp.getUi().ButtonSet.OK
+  );
+}
+
+function costingComparePlanFactPrompt_() {
+  const ui = SpreadsheetApp.getUi();
+  const res = ui.prompt(
+    'Сверка план vs факт',
+    'Введите SHIPMENT_ID (пусто = все):',
+    ui.ButtonSet.OK_CANCEL
+  );
+  if (res.getSelectedButton() !== ui.Button.OK) return;
+  const shipmentId = String(res.getResponseText() || '').trim();
+  const text = costingBuildPlanFactCompareReport_(shipmentId || null);
+  ui.alert('Сверка план vs факт', text, ui.ButtonSet.OK);
+}
+
+function costingBuildPlanFactCompareFromReport_(report, shipmentFilter) {
+  if (!report || !report.rows || !report.rows.length) {
+    return 'Нет строк для сверки.';
+  }
+  let count = 0;
+  let dutyDiffSum = 0;
+  let vatDiffSum = 0;
+  const lines = [];
+  const n = report.rows[0].length;
+  const idxDutyFact = 11;
+  const idxVatFact = 12;
+  const idxDutyPlan = n - 3;
+  const idxVatPlan = n - 2;
+  for (let i = 0; i < report.rows.length; i++) {
+    const r = report.rows[i];
+    const sid = String(r[1] || '').trim();
+    if (shipmentFilter && sid !== shipmentFilter) continue;
+    const dutyF = costingToNumber_(r[idxDutyFact]);
+    const vatF = costingToNumber_(r[idxVatFact]);
+    const dutyP = costingToNumber_(r[idxDutyPlan]);
+    const vatP = costingToNumber_(r[idxVatPlan]);
+    const dDuty = dutyF - dutyP;
+    const dVat = vatF - vatP;
+    if (Math.abs(dDuty) < 0.01 && Math.abs(dVat) < 0.01) continue;
+    count++;
+    dutyDiffSum += dDuty;
+    vatDiffSum += dVat;
+    if (lines.length < 12) {
+      lines.push(sid + ' / ' + r[2] + ': Δпошлина ' + dDuty.toFixed(2) + ', ΔНДС ' + dVat.toFixed(2));
+    }
+  }
+  let out = 'Строк с расхождением: ' + count + '\nΣ Δпошлина: ' + dutyDiffSum.toFixed(2) + '\nΣ ΔНДС: ' + vatDiffSum.toFixed(2);
+  if (lines.length) out += '\n\nПримеры:\n• ' + lines.join('\n• ');
+  return out;
+}
+
+function costingBuildPlanFactCompareReport_(shipmentFilter) {
+  const ss = SpreadsheetApp.getActiveSpreadsheet();
+  const factSh = costingFindSheetByRole_(ss, 'COST_SKU_FACT');
+  if (!factSh || factSh.getLastRow() < 2) {
+    return 'Лист «Факт_себестоимость SKU» пуст. Сначала выполните фактический пересчёт.';
+  }
+  const data = factSh.getDataRange().getValues();
+  const h = data[0];
+  const idxShip = costingFindCol_(h, ['SHIPMENT_ID', 'Shipment_ID', 'Рейс']);
+  const idxSku = costingFindCol_(h, ['Артикул_ВБ', 'Артикул ВБ', 'WB_ARTICLE']);
+  const idxDuty = costingFindCol_(h, ['Пошлина_RUB', 'Пошлина RUB', 'Пошлина']);
+  const idxVat = costingFindCol_(h, ['НДС_RUB', 'НДС RUB', 'НДС']);
+  const idxDutyPlan = costingFindColOptional_(h, ['Пошлина_план_RUB', 'Пошлина план RUB']);
+  const idxVatPlan = costingFindColOptional_(h, ['НДС_план_RUB', 'НДС план RUB']);
+  if (idxDutyPlan == null || idxVatPlan == null) {
+    return 'На листе факта нет колонок Пошлина_план_RUB / НДС_план_RUB. Запустите пересчёт факта заново.';
+  }
+  let count = 0;
+  let dutyDiffSum = 0;
+  let vatDiffSum = 0;
+  const lines = [];
+  for (let i = 1; i < data.length; i++) {
+    const r = data[i];
+    const sid = String(r[idxShip] || '').trim();
+    if (shipmentFilter && sid !== shipmentFilter) continue;
+    const dDuty = costingToNumber_(r[idxDuty]) - costingToNumber_(r[idxDutyPlan]);
+    const dVat = costingToNumber_(r[idxVat]) - costingToNumber_(r[idxVatPlan]);
+    if (Math.abs(dDuty) < 0.01 && Math.abs(dVat) < 0.01) continue;
+    count++;
+    dutyDiffSum += dDuty;
+    vatDiffSum += dVat;
+    if (lines.length < 15) {
+      lines.push(sid + ' / ' + r[idxSku] + ': Δпошлина ' + dDuty.toFixed(2) + ', ΔНДС ' + dVat.toFixed(2));
+    }
+  }
+  let out = 'Строк с расхождением: ' + count + '\nΣ Δпошлина: ' + dutyDiffSum.toFixed(2) + '\nΣ ΔНДС: ' + vatDiffSum.toFixed(2);
+  if (lines.length) out += '\n\n' + lines.join('\n');
+  return out;
 }
 
 function costingNormalizeRate_(v) {
@@ -1139,7 +1566,8 @@ function costingFillEmptyFxRatesCore_() {
   };
 }
 
-function costingLoadCustomsPoolsByShipment_(ss, shipmentFilter) {
+function costingLoadCustomsPoolsByShipment_(ss, shipmentFilter, scenarioMode) {
+  const wantFact = String(scenarioMode || 'PLAN').toUpperCase() === 'FACT';
   const sh = costingFindSheetByRole_(ss, 'CUSTOMS');
   if (!sh || sh.getLastRow() < 2) return {};
   const data = sh.getDataRange().getValues();
@@ -1157,7 +1585,10 @@ function costingLoadCustomsPoolsByShipment_(ss, shipmentFilter) {
     const shipmentId = String(r[idxShipment] || '').trim();
     if (!shipmentId) continue;
     if (shipmentFilter && shipmentId !== shipmentFilter) continue;
-    if (idxScenario != null && String(r[idxScenario] || '').trim().toUpperCase() === 'FACT') continue;
+    if (idxScenario != null) {
+      const sc = String(r[idxScenario] || '').trim().toUpperCase();
+      if (wantFact ? sc !== 'FACT' : sc === 'FACT') continue;
+    }
     if (!out[shipmentId]) {
       out[shipmentId] = { dutyRub: 0, vatRub: 0, customsFeeRub: 0 };
     }
@@ -1850,6 +2281,9 @@ function costingFindSheetByRole_(ss, role) {
     CUSTOMS_FEE_RATES: ['Справочник_таможсбор', 'Справочник таможсбор', 'Справочник таможенного сбора'],
     ALLOCATION: ['Аллокация затрат', 'Аллокация_затрат'],
     COST_SKU: ['Себестоимость SKU', 'Себестоимость_SKU'],
+    DECL_LINES: ['Декларации_строки', 'Декларации строки'],
+    DECL_JOURNAL: ['Декларации_журнал', 'Декларации журнал', 'Загрузки_ДТ', 'Загрузки ДТ'],
+    COST_SKU_FACT: ['Факт_себестоимость SKU', 'Факт себестоимость SKU'],
     TRIPS: ['Рейсы'],
     EVENTS: ['События_рейса', 'События рейса'],
     EVENT_TYPES: ['Типы_событий', 'Типы событий'],
@@ -1868,6 +2302,9 @@ function costingFindSheetByRole_(ss, role) {
     CUSTOMS_FEE_RATES: ['таможсбор'],
     ALLOCATION: ['аллокац'],
     COST_SKU: ['себестоим', 'sku'],
+    DECL_LINES: ['декларац', 'строк'],
+    DECL_JOURNAL: ['декларац', 'журнал', 'загрузк', 'дт'],
+    COST_SKU_FACT: ['факт', 'себестоим'],
     TRIPS: ['рейс'],
     EVENTS: ['событ', 'рейс'],
     EVENT_TYPES: ['типы', 'событ'],

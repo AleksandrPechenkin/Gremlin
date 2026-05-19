@@ -874,9 +874,24 @@ function payLogExtractDriveFileId_(url) {
 /* ===================== Синхронизация факта оплаты ===================== */
 
 function payLogSyncPaidStatuses() {
+  const r = payLogSyncPaidStatusesImpl_({});
+  if (r && r.message && !r.silent) {
+    SpreadsheetApp.getUi().alert(r.message);
+  }
+}
+
+/**
+ * @param {{ silent?: boolean }} opt
+ * @returns {{ updated: number, message: string, silent: boolean }}
+ */
+function payLogSyncPaidStatusesImpl_(opt) {
+  const silent = !!(opt && opt.silent);
   const sh = payLogEnsureQueueSheet_();
   const last = sh.getLastRow();
-  if (last < 2) return SpreadsheetApp.getUi().alert('Нет логистических заявок для синхронизации.');
+  if (last < 2) {
+    const msg = 'Нет логистических заявок для синхронизации.';
+    return { updated: 0, message: msg, silent: silent };
+  }
   const rows = sh.getRange(2, 1, last - 1, 17).getValues();
 
   const registryId = payLogProp_('PAYMENT_REGISTRY_SPREADSHEET_ID', PAY_LOG_CFG.REGISTRY_ID_DEFAULT);
@@ -911,5 +926,6 @@ function payLogSyncPaidStatuses() {
     sh.getRange(i + 2, 14).setValue('Оплачено (синхр.)');
     updated++;
   }
-  SpreadsheetApp.getUi().alert('Синхронизация завершена. Обновлено заявок: ' + updated);
+  const msg = 'Синхронизация завершена. Обновлено заявок: ' + updated;
+  return { updated: updated, message: msg, silent: silent };
 }

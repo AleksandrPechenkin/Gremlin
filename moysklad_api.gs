@@ -101,3 +101,5 @@ function msDelete(endpoint) { return msApiRequest(endpoint, 'delete', null); }
 function msFetch(endpoint, method, payload) {
   return msApiRequest(endpoint, method || 'get', payload);
 }
+
+// normalizeMsEntityId_, validateMsOrganization_, fetchMsOrganizationsList_ — в main.gs

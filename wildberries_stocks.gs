@@ -135,7 +135,7 @@ function wbBuildFromWarehouseRemains_(token, needWb, needBc) {
   for (let i = 0; i < rows.length; i++) {
     const row = rows[i];
     const qty = wbWarehouseLineQtyFromWarehouses_(row.warehouses);
-    const nmKey = row.nmId != null ? ppCanonArticle_(String(row.nmId)) : '';
+    const nmKey = row.nmId != null ? ppCanonWbArticleKey_(String(row.nmId)) : '';
     const bcKey = row.barcode != null ? ppCanonBarcodeForStock_(String(row.barcode)) : '';
     const vcKey = row.vendorCode != null ? ppCanonArticle_(String(row.vendorCode)) : '';
     if (nmKey && needWb[nmKey]) stockByWb[nmKey] = (stockByWb[nmKey] || 0) + qty;
@@ -170,7 +170,7 @@ function wbBuildFromSupplierStocks_(token, needWb, needBc) {
     const r = all[i];
     const qRaw = useFull ? r.quantityFull : r.quantity;
     const qty = Math.round(parseFloat(qRaw) || 0);
-    const nmKey = r.nmId != null ? ppCanonArticle_(String(r.nmId)) : '';
+    const nmKey = r.nmId != null ? ppCanonWbArticleKey_(String(r.nmId)) : '';
     const bcKey = r.barcode != null ? ppCanonBarcodeForStock_(String(r.barcode)) : '';
     const saKey = r.supplierArticle != null ? ppCanonArticle_(String(r.supplierArticle)) : '';
     if (nmKey && needWb[nmKey]) stockByWb[nmKey] = (stockByWb[nmKey] || 0) + qty;

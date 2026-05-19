@@ -26,7 +26,9 @@ const DEFAULT_SELLER = {
   address:
     'First floor, No. 2, 6, 8, Changchun 8th Street, Futian Street, Yiwu City, Jinhua City, Zhejiang Province, China',
   contacts: 'E-mail: bavier_logistic@163.com    WhatsApp/WeChat: +86 158 1818 0019',
-  bank: 'SWIFT: VTBRCNSH    Bank: Foreign Trade Bank of Russia Shanghai Branch    CNY A/C: 40807156700610047967'
+  bank: 'SWIFT: VTBRCNSH    Bank: Foreign Trade Bank of Russia Shanghai Branch    CNY A/C: 40807156700610047967',
+  contractNo: '',
+  contractDate: ''
 };
 
 const DEFAULT_PAYMENT_TERMS =
@@ -34,6 +36,32 @@ const DEFAULT_PAYMENT_TERMS =
 
 const SUMMARY_SHEET_NAME = 'Сводная';
 const SUMMARY_LINK_HEADER = 'Ссылка на инвойс';
+
+const SELLER_EDITOR_EMAIL = 'banych83@gmail.com';
+
+const INVOICE_FORM_PROFORMA = 'proforma';
+const INVOICE_FORM_COMMERCIAL = 'commercial';
+
+const INVOICE_FORMS = {
+  [INVOICE_FORM_PROFORMA]: {
+    key: INVOICE_FORM_PROFORMA,
+    label: 'Proforma Invoice',
+    heading: 'PROFORMA INVOICE',
+    plLabel: 'Proforma Invoice No'
+  },
+  [INVOICE_FORM_COMMERCIAL]: {
+    key: INVOICE_FORM_COMMERCIAL,
+    label: 'Commercial Invoice',
+    heading: 'COMMERCIAL INVOICE',
+    plLabel: 'Commercial Invoice No'
+  }
+};
+
+function invResolveInvoiceForm_(formKey) {
+  const raw = String(formKey == null ? '' : formKey).trim().toLowerCase();
+  if (INVOICE_FORMS[raw]) return INVOICE_FORMS[raw];
+  return INVOICE_FORMS[INVOICE_FORM_PROFORMA];
+}
 
 function invLog_(level, message, context) {
   const tail = context != null ? ' | ' + JSON.stringify(context) : '';
@@ -103,6 +131,52 @@ function invColByHeader_(map, variants) {
   return null;
 }
 
+/**
+ * Все известные написания заголовка колонки с номером спецификации
+ * (в т.ч. с дополнениями «/Инвойса», «/Инвойс»). Используем во всех местах,
+ * где нужно найти эту колонку — менеджерская вкладка и «Сводная».
+ */
+function invSpecHeaderVariants_() {
+  return [
+    'Номер спецификации',
+    'Номер Спецификации',
+    'Спецификация',
+    'Номер спецификации/инвойса',
+    'Номер Спецификации/Инвойса',
+    'Номер спецификации/Инвойса',
+    'Номер Спецификации/инвойса',
+    'Спецификация/Инвойс',
+    'Спецификация/инвойс',
+    'Спецификация/Инвойса',
+    'Спецификация/инвойса',
+    'Спецификация / Инвойс',
+    'Спецификация / инвойс'
+  ];
+}
+
+/**
+ * Доп. защита: иногда заголовок отличается мелочами (точка, «№», лишний
+ * слэш и т.п.). Если явных вариантов не хватило — ищем колонку, у которой
+ * канон-имя начинается на «номерспецификации» или «спецификация», но не
+ * содержит «сумма»/«цена»/«статус» и т.п. (чтобы не утащить случайную
+ * соседнюю колонку).
+ */
+function invFindSpecColLoose_(headers) {
+  const blacklist = ['сумма', 'цена', 'статус', 'количество', 'артикул', 'дата', 'поставщик', 'объем', 'вес', 'ссылка', 'отгрузка'];
+  for (let c = 0; c < headers.length; c++) {
+    const k = invCanon_(headers[c]);
+    if (!k) continue;
+    const isSpec = k.indexOf('номерспецификации') === 0 || k.indexOf('спецификации') === 0 || k.indexOf('спецификация') === 0;
+    if (!isSpec) continue;
+    let bad = false;
+    for (let b = 0; b < blacklist.length; b++) {
+      if (k.indexOf(blacklist[b]) >= 0) { bad = true; break; }
+    }
+    if (!bad) return c;
+  }
+  return null;
+}
+
 function invRequiredStatus_() {
   return invNormStatus_(invGetProp_('INVOICE_REQUIRED_STATUS', INV_DEFAULT_STATUS));
 }
@@ -130,10 +204,55 @@ function invIsLikelyUrl_(v) {
   return /^https?:\/\//i.test(s) || /^https?:\/\//i.test(String(v));
 }
 
+function invCurrentUserEmail_() {
+  try {
+    const active = String((Session.getActiveUser && Session.getActiveUser().getEmail()) || '').trim();
+    if (active) return active.toLowerCase();
+  } catch (e) {}
+  try {
+    const eff = String((Session.getEffectiveUser && Session.getEffectiveUser().getEmail()) || '').trim();
+    if (eff) return eff.toLowerCase();
+  } catch (e) {}
+  return '';
+}
+
+/** Доступна google.script.run — используется HTML-формой для скрытия/показа полей. */
+function invCanEditSellers() {
+  return invCurrentUserEmail_() === String(SELLER_EDITOR_EMAIL).toLowerCase();
+}
+
+function invRequireSellerEditor_() {
+  if (!invCanEditSellers()) {
+    throw new Error(
+      'Редактирование справочника поставщиков разрешено только пользователю ' +
+      SELLER_EDITOR_EMAIL + '. Текущий пользователь: ' + (invCurrentUserEmail_() || 'неизвестен')
+    );
+  }
+}
+
+/**
+ * Приводит дату контракта к формату dd.MM.yyyy для отображения в инвойсе.
+ * Поддерживает входные форматы: yyyy-MM-dd (HTML input type=date), dd.MM.yyyy,
+ * dd/MM/yyyy, объект Date. Если формат не распознан — возвращает строку как есть.
+ */
+function invFormatContractDate_(v) {
+  if (v == null || v === '') return '';
+  if (Object.prototype.toString.call(v) === '[object Date]' && !isNaN(v.getTime())) {
+    return Utilities.formatDate(v, Session.getScriptTimeZone() || 'GMT+8', 'dd.MM.yyyy');
+  }
+  const s = String(v).trim();
+  let m = s.match(/^(\d{4})-(\d{2})-(\d{2})$/);
+  if (m) return m[3] + '.' + m[2] + '.' + m[1];
+  m = s.match(/^(\d{2})[.\/-](\d{2})[.\/-](\d{4})$/);
+  if (m) return m[1] + '.' + m[2] + '.' + m[3];
+  return s;
+}
+
 /** Второе меню: вызывайте из onOpen — addSupplierInvoiceMenu_(ui); */
 function addSupplierInvoiceMenu_(ui) {
   ui.createMenu('📄 Инвойсы поставщику')
     .addItem('Сформировать инвойс по спецификации…', 'invStartWizard')
+    .addItem('Сформировать общий инвойс (несколько спецификаций)…', 'invStartCombinedWizard')
     .addSeparator()
     .addItem('Справочник: компании (продавцы)', 'invShowSellersSettings')
     .addItem('Справочник: условия оплаты', 'invShowPaymentTermsSettings')
@@ -171,7 +290,8 @@ function invStartWizard() {
       invColByHeader_(hmap, ['Статус заказа', 'Статус', 'STATUS']) ??
       invFallbackStatusCol_() - 1;
     const specCol0 =
-      invColByHeader_(hmap, ['Номер спецификации', 'Номер Спецификации', 'Спецификация']) ??
+      invColByHeader_(hmap, invSpecHeaderVariants_()) ??
+      invFindSpecColLoose_(headers) ??
       invFallbackSpecCol_() - 1;
 
     const need = invRequiredStatus_();
@@ -195,8 +315,8 @@ function invStartWizard() {
 
     const paymentTerms = getSavedTerms();
     const html = HtmlService.createHtmlOutput(invBuildSpecDialogHtml_(specs, paymentTerms))
-      .setWidth(420)
-      .setHeight(320);
+      .setWidth(440)
+      .setHeight(390);
     SpreadsheetApp.getUi().showModalDialog(html, 'Выбор спецификации');
   } catch (e) {
     invLog_('ERROR', 'invStartWizard_', { error: String(e && e.message ? e.message : e) });
@@ -209,6 +329,184 @@ function invStartWizard_() {
   return invStartWizard();
 }
 
+/**
+ * Запуск мастера «общий инвойс»: один файл на несколько спецификаций
+ * одной и той же компании из колонки «Отгрузка через».
+ */
+function invStartCombinedWizard() {
+  const ui = SpreadsheetApp.getUi();
+  try {
+    invGetPropOrThrow_('INVOICE_DRIVE_FOLDER_ID');
+
+    const ss = SpreadsheetApp.getActiveSpreadsheet();
+    const sheet = ss.getActiveSheet();
+    if (!sheet) { ui.alert('Нет активного листа.'); return; }
+    if (invNorm_(sheet.getName()) === invNorm_(SUMMARY_SHEET_NAME)) {
+      ui.alert('Откройте вкладку менеджера (не «Сводная») и повторите.');
+      return;
+    }
+
+    const data = invCollectShipViaSpecsForSheet_(sheet);
+    if (!data.companies.length) {
+      ui.alert(
+        'Не найдено строк со статусом «' + invRequiredStatus_() +
+        '» и одновременно заполненными колонками «Отгрузка через» и «Номер спецификации» на листе «' +
+        sheet.getName() + '».'
+      );
+      return;
+    }
+
+    const paymentTerms = getSavedTerms();
+    const html = HtmlService.createHtmlOutput(invBuildCombinedDialogHtml_(data, paymentTerms))
+      .setWidth(560)
+      .setHeight(580);
+    ui.showModalDialog(html, 'Общий инвойс на несколько спецификаций');
+  } catch (e) {
+    invLog_('ERROR', 'invStartCombinedWizard', { error: String(e && e.message ? e.message : e) });
+    ui.alert('Ошибка', String(e && e.message ? e.message : e), ui.ButtonSet.OK);
+  }
+}
+
+/**
+ * Возвращает компании из колонки «Отгрузка через» и их спецификации со статусом
+ * «Сформировать инвойс» для активной вкладки. Считает строки и сумму по каждой
+ * спецификации — нужно для пометки в диалоге.
+ */
+function invCollectShipViaSpecsForSheet_(sheet) {
+  const result = { companies: [] };
+  const lastCol = Math.max(sheet.getLastColumn(), invFallbackSpecCol_(), invManagerLinkCol_());
+  const lastRow = sheet.getLastRow();
+  if (lastRow < INV_DATA_START_ROW) return result;
+
+  const headers = sheet.getRange(INV_HEADER_ROW, 1, INV_HEADER_ROW, lastCol).getValues()[0];
+  const hmap = invBuildHeaderIndex_(headers);
+
+  const statusCol0 =
+    invColByHeader_(hmap, ['Статус заказа', 'Статус', 'STATUS']) ?? invFallbackStatusCol_() - 1;
+  const specCol0 =
+    invColByHeader_(hmap, invSpecHeaderVariants_()) ??
+    invFindSpecColLoose_(headers) ??
+    invFallbackSpecCol_() - 1;
+  const shipViaCol0 = invColByHeader_(hmap, ['Отгрузка через']);
+  const qtyCol0 = invColByHeader_(hmap, ['Итоговое количество', 'Количество']);
+  const priceCol0 = invColByHeader_(hmap, ['Цена']);
+  const amountCol0 = invColByHeader_(hmap, ['Сумма']);
+
+  if (shipViaCol0 == null) {
+    throw new Error('На активной вкладке не найдена колонка «Отгрузка через».');
+  }
+
+  const need = invRequiredStatus_();
+  const data = sheet.getRange(INV_DATA_START_ROW, 1, lastRow, lastCol).getValues();
+  const map = {};
+  for (let i = 0; i < data.length; i++) {
+    const row = data[i];
+    if (invNormStatus_(row[statusCol0]) !== need) continue;
+    const ship = invNorm_(row[shipViaCol0]);
+    const spec = invNorm_(row[specCol0]);
+    if (!ship || !spec) continue;
+    const qty = qtyCol0 != null ? invParseNumber_(row[qtyCol0]) : NaN;
+    const price = priceCol0 != null ? invParseNumber_(row[priceCol0]) : NaN;
+    let amount = amountCol0 != null ? invParseNumber_(row[amountCol0]) : NaN;
+    if (!isFinite(amount) && isFinite(qty) && isFinite(price)) amount = qty * price;
+    if (!isFinite(amount)) amount = 0;
+
+    if (!map[ship]) map[ship] = {};
+    if (!map[ship][spec]) map[ship][spec] = { linesCount: 0, amount: 0 };
+    map[ship][spec].linesCount++;
+    map[ship][spec].amount += amount;
+  }
+
+  Object.keys(map).sort().forEach(function (cn) {
+    const specs = Object.keys(map[cn]).sort().map(function (sp) {
+      return {
+        number: sp,
+        linesCount: map[cn][sp].linesCount,
+        amount: Math.round(map[cn][sp].amount * 100) / 100
+      };
+    });
+    result.companies.push({ company: cn, specs: specs });
+  });
+  return result;
+}
+
+function invBuildCombinedDialogHtml_(data, paymentTerms) {
+  const terms = Array.isArray(paymentTerms) && paymentTerms.length
+    ? paymentTerms
+    : [DEFAULT_PAYMENT_TERMS];
+  const safeJson = JSON.stringify(data).replace(/</g, '\\u003c').replace(/>/g, '\\u003e');
+  const termsOptions = terms.map(function (t, i) {
+    const shortLabel = String(t || '').length > 90 ? String(t).slice(0, 90) + '...' : String(t || '');
+    return '<option value="' + i + '">' + invEscapeHtml_(shortLabel) + '</option>';
+  }).join('');
+
+  return [
+    '<!DOCTYPE html><html><head><base target="_top"><meta charset="utf-8">',
+    '<style>',
+    'body{font-family:Arial,sans-serif;padding:12px;margin:0}',
+    'label{font-size:12px;color:#444}',
+    'select,input[type=text]{width:100%;box-sizing:border-box;margin:4px 0 8px}',
+    '.btn{margin-top:4px;padding:7px 14px}',
+    '.specsBox{margin:6px 0 8px;border:1px solid #ddd;border-radius:4px;padding:8px;max-height:210px;overflow:auto;background:#fafafa}',
+    '.specRow{display:block;padding:4px 0;border-bottom:1px dashed #e0e0e0;font-size:13px}',
+    '.specRow:last-child{border-bottom:none}',
+    '.specRow input{margin-right:8px;vertical-align:middle}',
+    '.meta{color:#666;font-size:11px;margin-left:4px}',
+    '.bar{display:flex;justify-content:space-between;align-items:center;margin:4px 0}',
+    '.barInfo{font-size:12px;color:#444}',
+    '.empty{color:#888;font-size:12px;padding:8px}',
+    '.hint{font-size:11px;color:#666;margin:-4px 0 6px}',
+    '</style></head><body>',
+
+    '<label>Форма документа</label>',
+    '<select id="form">',
+    '<option value="', INVOICE_FORM_PROFORMA, '" selected>Proforma Invoice (предварительный)</option>',
+    '<option value="', INVOICE_FORM_COMMERCIAL, '">Commercial Invoice (итоговый)</option>',
+    '</select>',
+
+    '<label>Отгрузка через</label>',
+    '<select id="company" onchange="renderSpecs()"></select>',
+    '<div class="hint">Список спецификаций обновится автоматически при смене компании.</div>',
+
+    '<div class="bar">',
+    '<div class="barInfo" id="selSummary">Выбрано: 0 из 0</div>',
+    '<div>',
+    '<button type="button" class="btn" onclick="selectAll(true)">Выбрать все</button> ',
+    '<button type="button" class="btn" onclick="selectAll(false)">Снять все</button>',
+    '</div></div>',
+    '<div id="specsBox" class="specsBox"></div>',
+
+    '<label>Вариант оплаты</label>',
+    '<select id="term">', termsOptions, '</select>',
+
+    '<div style="margin-top:10px;font-size:12px;color:#555">Будет создан один файл, объединяющий выбранные спецификации. Номера будут перечислены через «/».</div>',
+
+    '<button class="btn" type="button" id="goBtn" onclick="go()" disabled>Сформировать</button> ',
+    '<button class="btn" type="button" onclick="google.script.host.close()">Отмена</button>',
+
+    '<script>',
+    'var DATA=', safeJson, ';',
+    'function esc(s){return String(s||"").replace(/&/g,"&amp;").replace(/</g,"&lt;").replace(/>/g,"&gt;").replace(/"/g,"&quot;");}',
+    'function fmtNum(n){if(!isFinite(n))return "0.00";return Number(n).toLocaleString("ru-RU",{minimumFractionDigits:2,maximumFractionDigits:2});}',
+    'function getCompany(){var sel=document.getElementById("company");return DATA.companies.filter(function(c){return c.company===sel.value;})[0];}',
+    'function renderSpecs(){var box=document.getElementById("specsBox");var c=getCompany();',
+    'if(!c){box.innerHTML="<div class=\\"empty\\">(нет данных)</div>";updateSummary();return;}',
+    'box.innerHTML=c.specs.map(function(s){return "<label class=\\"specRow\\"><input type=\\"checkbox\\" class=\\"spcChk\\" value=\\""+esc(s.number)+"\\" onchange=\\"updateSummary()\\">"+esc(s.number)+" <span class=\\"meta\\">— "+s.linesCount+" поз., "+fmtNum(s.amount)+" CNY</span></label>";}).join("");',
+    'updateSummary();}',
+    'function getChecked(){return Array.prototype.slice.call(document.querySelectorAll(".spcChk")).filter(function(x){return x.checked;}).map(function(x){return x.value;});}',
+    'function updateSummary(){var total=document.querySelectorAll(".spcChk").length;var checked=getChecked().length;document.getElementById("selSummary").textContent="Выбрано: "+checked+" из "+total;document.getElementById("goBtn").disabled=(checked===0);}',
+    'function selectAll(on){Array.prototype.slice.call(document.querySelectorAll(".spcChk")).forEach(function(x){x.checked=!!on;});updateSummary();}',
+    'function go(){var f=document.getElementById("form").value;var t=Number(document.getElementById("term").value);var c=document.getElementById("company").value;var specs=getChecked();if(!specs.length){alert("Выберите хотя бы одну спецификацию.");return;}',
+    'var btns=document.querySelectorAll("button");btns.forEach(function(b){b.disabled=true;});',
+    'google.script.run.withSuccessHandler(function(){google.script.host.close();})',
+    '.withFailureHandler(function(e){btns.forEach(function(b){b.disabled=false;});updateSummary();alert(e.message||e);})',
+    '.invGenerateForSpecsChosen(specs, t, f, c);}',
+    'function init(){var sel=document.getElementById("company");sel.innerHTML=DATA.companies.map(function(c){return "<option value=\\""+esc(c.company)+"\\">"+esc(c.company)+" — "+c.specs.length+" спец.</option>";}).join("");renderSpecs();}',
+    'init();',
+    '</script></body></html>'
+  ].join('');
+}
+
 function invBuildSpecDialogHtml_(specs, paymentTerms) {
   const terms = Array.isArray(paymentTerms) && paymentTerms.length
     ? paymentTerms
@@ -216,14 +514,21 @@ function invBuildSpecDialogHtml_(specs, paymentTerms) {
   return (
     '<!DOCTYPE html><html><head><base target="_top"><meta charset="utf-8">' +
     '<style>body{font-family:Arial,sans-serif;padding:12px}select,input{width:100%;box-sizing:border-box;margin:6px 0}' +
-    '.btn{margin-top:10px;padding:8px 14px}</style></head><body>' +
-    '<div>Номер спецификации</div>' +
+    'label{font-size:12px;color:#444}.btn{margin-top:10px;padding:8px 14px}' +
+    '.hint{margin-top:4px;font-size:11px;color:#666}</style></head><body>' +
+    '<label>Форма документа</label>' +
+    '<select id="form">' +
+    '<option value="' + INVOICE_FORM_PROFORMA + '" selected>Proforma Invoice (предварительный)</option>' +
+    '<option value="' + INVOICE_FORM_COMMERCIAL + '">Commercial Invoice (итоговый)</option>' +
+    '</select>' +
+    '<div class="hint">Влияет только на название документа в шапке и имени файла.</div>' +
+    '<label style="margin-top:10px;display:block">Номер спецификации</label>' +
     '<select id="spec">' +
     specs.map(function (s) {
       return '<option value="' + invEscapeHtml_(s) + '">' + invEscapeHtml_(s) + '</option>';
     }).join('') +
     '</select>' +
-    '<div style="margin-top:10px">Вариант оплаты</div>' +
+    '<label style="margin-top:10px;display:block">Вариант оплаты</label>' +
     '<select id="term">' +
     terms.map(function (t, i) {
       const shortLabel = String(t || '').length > 90 ? String(t).slice(0, 90) + '...' : String(t || '');
@@ -238,10 +543,11 @@ function invBuildSpecDialogHtml_(specs, paymentTerms) {
     '<button class="btn" onclick="go()">Сформировать</button> ' +
     '<button class="btn" onclick="google.script.host.close()">Отмена</button>' +
     '<script>function go(){var s=document.getElementById("spec").value;var t=document.getElementById("term").value;' +
+    'var f=document.getElementById("form").value;' +
     'var btns=document.querySelectorAll(\"button\");btns.forEach(function(b){b.disabled=true;});' +
     'google.script.run.withSuccessHandler(function(){google.script.host.close();})' +
     '.withFailureHandler(function(e){btns.forEach(function(b){b.disabled=false;});alert(e.message||e);})' +
-    '.invGenerateForSpecChosen(s, Number(t));}</script></body></html>'
+    '.invGenerateForSpecChosen(s, Number(t), f);}</script></body></html>'
   );
 }
 
@@ -265,16 +571,44 @@ function invColLetter_(n) {
 }
 
 /**
- * Вызывается из диалога: создаёт файл, проставляет ссылки.
+ * Старая точка вызова из диалога одной спецификации. Делегирует в новый поток.
  * @param {string} specNumber
  * @param {number=} paymentTermIndex
+ * @param {string=} invoiceFormKey  'proforma' (по умолчанию) или 'commercial'
  */
-function invGenerateForSpecChosen(specNumber, paymentTermIndex) {
+function invGenerateForSpecChosen(specNumber, paymentTermIndex, invoiceFormKey) {
+  return invGenerateForSpecsChosen([specNumber], paymentTermIndex, invoiceFormKey, '');
+}
+
+/**
+ * Создаёт один файл (Proforma/Commercial Invoice + Packing List) на одну
+ * или несколько спецификаций, относящихся к одной компании из колонки
+ * «Отгрузка через». Проставляет ссылки во все строки этих спецификаций
+ * на активной вкладке и на «Сводной».
+ *
+ * @param {string[]} specNumbers   Список номеров спецификаций.
+ * @param {number=}  paymentTermIndex
+ * @param {string=}  invoiceFormKey  'proforma' (по умолчанию) или 'commercial'
+ * @param {string=}  shipViaCompanyHint  Имя компании из диалога «общий инвойс»
+ *                                       (для подсказки/совместимости — не критично).
+ */
+function invGenerateForSpecsChosen(specNumbers, paymentTermIndex, invoiceFormKey, shipViaCompanyHint) {
   const ui = SpreadsheetApp.getUi();
-  const spec = invNorm_(specNumber);
-  if (!spec) {
-    throw new Error('Пустой номер спецификации.');
+
+  const rawList = Array.isArray(specNumbers) ? specNumbers : [specNumbers];
+  const normSpecs = [];
+  const seen = {};
+  for (let i = 0; i < rawList.length; i++) {
+    const s = invNorm_(rawList[i]);
+    if (!s || seen[s]) continue;
+    seen[s] = true;
+    normSpecs.push(s);
   }
+  if (!normSpecs.length) {
+    throw new Error('Не выбраны спецификации.');
+  }
+
+  const invoiceForm = invResolveInvoiceForm_(invoiceFormKey);
 
   const folderId = invGetPropOrThrow_('INVOICE_DRIVE_FOLDER_ID');
   const folder = DriveApp.getFolderById(folderId);
@@ -293,7 +627,8 @@ function invGenerateForSpecChosen(specNumber, paymentTermIndex) {
   const statusCol0 =
     invColByHeader_(hmap, ['Статус заказа', 'Статус', 'STATUS']) ?? invFallbackStatusCol_() - 1;
   const specCol0 =
-    invColByHeader_(hmap, ['Номер спецификации', 'Номер Спецификации', 'Спецификация']) ??
+    invColByHeader_(hmap, invSpecHeaderVariants_()) ??
+    invFindSpecColLoose_(headers) ??
     invFallbackSpecCol_() - 1;
   const wbCol0 = invColByHeader_(hmap, ['Артикул ВБ', 'Артикул WB', 'WB']);
   const supplierArticleCol0 = invColByHeader_(hmap, ['Артикул поставщика', 'Supplier article']);
@@ -308,23 +643,59 @@ function invGenerateForSpecChosen(specNumber, paymentTermIndex) {
   const weightCol0 = invColByHeader_(hmap, ['Вес']);
 
   const need = invRequiredStatus_();
+  const specSet = {};
+  normSpecs.forEach(function (s) { specSet[s] = true; });
+
   const data = managerSheet.getRange(INV_DATA_START_ROW, 1, lastRow, lastCol).getValues();
 
   const hitRows = [];
-  const wbArticles = [];
+  const wbPairs = [];
+  const shipViasSeen = {};
   for (let i = 0; i < data.length; i++) {
     const row = data[i];
     if (invNormStatus_(row[statusCol0]) !== need) continue;
-    if (invNorm_(row[specCol0]) !== spec) continue;
+    const sp = invNorm_(row[specCol0]);
+    if (!sp || !specSet[sp]) continue;
     const absRow = INV_DATA_START_ROW + i;
-    hitRows.push({ absRow: absRow, row: row });
-    const wb =
-      wbCol0 != null ? invNorm_(row[wbCol0]) : invNorm_(row[0]);
-    if (wb) wbArticles.push(wb);
+    hitRows.push({ absRow: absRow, row: row, spec: sp });
+    const wb = wbCol0 != null ? invNorm_(row[wbCol0]) : invNorm_(row[0]);
+    if (wb) wbPairs.push({ spec: sp, wb: wb });
+    const sv = shipViaCol0 != null ? invNorm_(row[shipViaCol0]) : '';
+    if (sv) shipViasSeen[sv] = (shipViasSeen[sv] || 0) + 1;
   }
 
   if (!hitRows.length) {
-    throw new Error('Не найдено строк для этой спецификации и статуса.');
+    throw new Error('Не найдено строк по выбранным спецификациям и статусу.');
+  }
+
+  const foundSpecs = {};
+  hitRows.forEach(function (h) { foundSpecs[h.spec] = true; });
+  const missing = normSpecs.filter(function (s) { return !foundSpecs[s]; });
+  if (missing.length) {
+    throw new Error(
+      'Для спецификаций ' + missing.join(', ') +
+      ' не найдены строки со статусом «' + need + '».'
+    );
+  }
+
+  const shipViaNames = Object.keys(shipViasSeen);
+  if (shipViaNames.length > 1) {
+    throw new Error(
+      'В выбранных спецификациях разные компании в колонке «Отгрузка через»: ' +
+      shipViaNames.join(', ') +
+      '. Для общего инвойса все строки должны иметь одну и ту же компанию.'
+    );
+  }
+
+  const shipViaValue = shipViaNames.length
+    ? shipViaNames[0]
+    : invNorm_(shipViaCompanyHint);
+  const seller = invResolveSellerByShipViaStrict_(shipViaValue);
+  if (!invNorm_(seller.contractNo) || !invNorm_(seller.contractDate)) {
+    throw new Error(
+      'У компании «' + seller.name + '» не заполнен номер и/или дата контракта. ' +
+      'Откройте «📄 Инвойсы поставщику → Справочник: компании (продавцы)» и заполните реквизиты контракта.'
+    );
   }
 
   const linkCol = invManagerLinkCol_();
@@ -346,8 +717,6 @@ function invGenerateForSpecChosen(specNumber, paymentTermIndex) {
     if (res !== ui.Button.YES) return;
   }
 
-  const shipViaValue = shipViaCol0 != null ? invNorm_(hitRows[0].row[shipViaCol0]) : '';
-  const seller = invResolveSellerByShipViaStrict_(shipViaValue);
   const terms = invGetPaymentTermByIndex_(paymentTermIndex);
   const invoiceNo = invNextInvoiceNumber_();
 
@@ -358,7 +727,9 @@ function invGenerateForSpecChosen(specNumber, paymentTermIndex) {
     const barcode = barcodeCol0 != null ? invNorm_(row[barcodeCol0]) : '';
     const name = supplierArticleCol0 != null ? invNorm_(row[supplierArticleCol0]) : wb;
     const dir = directoryMap[invCanon_(wb)] || directoryMap[invCanon_(name)] || null;
-    const description = dir && dir.description ? dir.description : [name, 'Spec: ' + spec].filter(Boolean).join(' | ');
+    const description = dir && dir.description
+      ? dir.description
+      : [name, 'Spec: ' + h.spec].filter(Boolean).join(' | ');
     const packaging = dir && dir.packaging ? dir.packaging : '';
     const qty = qtyCol0 != null ? invParseNumber_(row[qtyCol0]) : invParseNumber_(row[6]);
     const pcsPerCarton = qtyPerBoxCol0 != null ? invParseNumber_(row[qtyPerBoxCol0]) : NaN;
@@ -388,18 +759,28 @@ function invGenerateForSpecChosen(specNumber, paymentTermIndex) {
       nwPerCarton: isFinite(perCartonWeight) ? perCartonWeight : '',
       gwPerCarton: isFinite(perCartonWeight) ? perCartonWeight : '',
       volumePerCarton: isFinite(perCartonVol) ? perCartonVol : '',
-      packaging: packaging
+      packaging: packaging,
+      spec: h.spec
     };
   });
 
-  const supplierName =
-    supCol0 != null ? invNorm_(hitRows[0].row[supCol0]) : '';
+  const supplierName = supCol0 != null ? invNorm_(hitRows[0].row[supCol0]) : '';
 
+  const specsDisplay = normSpecs.join('/');
+  const specsLabel = normSpecs.length > 1 ? ('Specs ' + specsDisplay) : ('Spec ' + specsDisplay);
   const titleBase =
-    'Invoice ' + invoiceNo + ' — Spec ' + spec + (supplierName ? ' — ' + supplierName : '');
-  invLog_('INFO', 'Создание файла', { title: titleBase, lines: lines.length });
+    invoiceForm.label + ' ' + invoiceNo + ' — ' + specsLabel +
+    (supplierName ? ' — ' + supplierName : '');
+  invLog_('INFO', 'Создание файла', {
+    title: titleBase,
+    lines: lines.length,
+    form: invoiceForm.key,
+    specs: normSpecs.length
+  });
 
-  const newSs = invCreateInvoiceWorkbook_(titleBase, invoiceNo, spec, supplierName, seller, terms, lines);
+  const newSs = invCreateInvoiceWorkbook_(
+    titleBase, invoiceNo, specsDisplay, supplierName, seller, terms, lines, invoiceForm
+  );
   const file = DriveApp.getFileById(newSs.getId());
   folder.addFile(file);
   DriveApp.getRootFolder().removeFile(file);
@@ -410,7 +791,7 @@ function invGenerateForSpecChosen(specNumber, paymentTermIndex) {
     managerSheet.getRange(hitRows[k].absRow, linkCol).setValue(url);
   }
 
-  invUpdateSummaryLinks_(spec, wbArticles, url);
+  invUpdateSummaryLinksMulti_(wbPairs, url);
 
   invLog_('INFO', 'Готово', { url: url });
   ui.alert('Готово', 'Файл создан:\n' + url, ui.ButtonSet.OK);
@@ -517,17 +898,34 @@ function invResolveSellerByShipViaStrict_(shipViaValue) {
   return exact;
 }
 
-function invCreateInvoiceWorkbook_(title, invoiceNo, spec, buyerHint, seller, terms, lines) {
+function invCreateInvoiceWorkbook_(title, invoiceNo, specsDisplay, buyerHint, seller, terms, lines, invoiceForm) {
+  const form = invoiceForm && invoiceForm.heading ? invoiceForm : invResolveInvoiceForm_('');
   const ss = SpreadsheetApp.create(title);
   const invSh = ss.getSheets()[0];
   invSh.setName('Invoice');
   const plSh = ss.insertSheet('Packing List');
   const invoiceDate = Utilities.formatDate(new Date(), 'GMT+8', 'dd.MM.yyyy');
 
-  // COMMERCIAL INVOICE
-  invSh.getRange('A1:K1').mergeAcross().setValue('INVOICE')
+  const specsText = String(specsDisplay || '').trim();
+  const specsCount = specsText ? specsText.split('/').filter(Boolean).length : 0;
+  const specsHeaderLabel = specsCount > 1
+    ? ('Specs: ' + specsText)
+    : (specsText ? ('Spec: ' + specsText) : '');
+
+  // INVOICE HEADER (Proforma / Commercial — отличие только в названии)
+  invSh.getRange('A1:K1').mergeAcross().setValue(form.heading)
     .setFontSize(22).setFontWeight('bold').setHorizontalAlignment('center');
-  invSh.getRange('A2:K2').mergeAcross().setValue('№ ' + invoiceNo + '    Date: ' + invoiceDate)
+  const headerLine2 = '№ ' + invoiceNo + '    Date: ' + invoiceDate +
+    (specsHeaderLabel ? '    ' + specsHeaderLabel : '');
+  invSh.getRange('A2:K2').mergeAcross().setValue(headerLine2)
+    .setFontSize(12).setFontWeight('bold').setHorizontalAlignment('center');
+
+  const contractNo = invNorm_(seller && seller.contractNo);
+  const contractDate = invFormatContractDate_(seller && seller.contractDate);
+  const contractLine = contractNo
+    ? 'Contract No: ' + contractNo + (contractDate ? '    dated ' + contractDate : '')
+    : '';
+  invSh.getRange('A3:K3').mergeAcross().setValue(contractLine)
     .setFontSize(12).setFontWeight('bold').setHorizontalAlignment('center');
 
   invSh.getRange('A4').setValue('Seller / Shipper:').setFontWeight('bold');
@@ -612,7 +1010,11 @@ function invCreateInvoiceWorkbook_(title, invoiceNo, spec, buyerHint, seller, te
   // PACKING LIST
   plSh.getRange('A1:J1').mergeAcross().setValue('PACKING LIST')
     .setFontSize(22).setFontWeight('bold').setHorizontalAlignment('center');
-  plSh.getRange('A2:J2').mergeAcross().setValue('Invoice No: ' + invoiceNo + '     Date: ' + invoiceDate)
+  const plLine2 = form.plLabel + ': ' + invoiceNo + '     Date: ' + invoiceDate +
+    (specsHeaderLabel ? '     ' + specsHeaderLabel : '');
+  plSh.getRange('A2:J2').mergeAcross().setValue(plLine2)
+    .setFontSize(12).setFontWeight('bold').setHorizontalAlignment('center');
+  plSh.getRange('A3:J3').mergeAcross().setValue(contractLine)
     .setFontSize(12).setFontWeight('bold').setHorizontalAlignment('center');
 
   const plHeaders = ['№', 'Article', 'Name / Наименование', 'Description', 'Barcode', 'Qty (pcs)', 'Cartons', 'N.W.(kg)', 'G.W.(kg)', 'Volume(m³)'];
@@ -667,7 +1069,14 @@ function invCreateInvoiceWorkbook_(title, invoiceNo, spec, buyerHint, seller, te
   return ss;
 }
 
-function invUpdateSummaryLinks_(spec, wbArticles, url) {
+/**
+ * Обновляет колонку «Ссылка на инвойс» на «Сводной» для строк, попавших
+ * в инвойс. wbPairs — массив { spec, wb }. Для каждой спецификации
+ * обновляются только строки с подходящим артикулом ВБ; если у строки на
+ * «Сводной» артикул пустой — она тоже обновляется, чтобы не оставлять
+ * её без ссылки.
+ */
+function invUpdateSummaryLinksMulti_(wbPairs, url) {
   const mainId = invGetProp_('MAIN_SPREADSHEET_ID', '');
   let ss;
   try {
@@ -698,25 +1107,52 @@ function invUpdateSummaryLinks_(spec, wbArticles, url) {
   const linkCol1 = linkCol0 != null ? linkCol0 + 1 : invSummaryLinkCol_();
 
   const specCol0 =
-    invColByHeader_(hmap, ['Номер спецификации', 'Номер Спецификации', 'Спецификация']) ?? 11;
+    invColByHeader_(hmap, invSpecHeaderVariants_()) ??
+    invFindSpecColLoose_(headers) ??
+    11;
   const wbCol0 = invColByHeader_(hmap, ['Артикул ВБ', 'Артикул WB', 'WB']) ?? 0;
 
   sh.getRange(INV_HEADER_ROW, linkCol1).setValue(SUMMARY_LINK_HEADER);
 
-  const wbSet = {};
-  for (let i = 0; i < wbArticles.length; i++) wbSet[invNorm_(wbArticles[i])] = true;
+  // spec -> { wb -> true }
+  const specMap = {};
+  const pairs = Array.isArray(wbPairs) ? wbPairs : [];
+  for (let i = 0; i < pairs.length; i++) {
+    const sp = invNorm_(pairs[i] && pairs[i].spec);
+    const wb = invNorm_(pairs[i] && pairs[i].wb);
+    if (!sp) continue;
+    if (!specMap[sp]) specMap[sp] = {};
+    if (wb) specMap[sp][wb] = true;
+  }
+  if (!Object.keys(specMap).length) {
+    invLog_('INFO', 'Сводная: нет пар spec/wb для обновления', {});
+    return;
+  }
 
   const data = sh.getRange(INV_DATA_START_ROW, 1, lastRow, lastCol).getValues();
   let updated = 0;
   for (let i = 0; i < data.length; i++) {
     const row = data[i];
-    if (invNorm_(row[specCol0]) !== invNorm_(spec)) continue;
-    const wb = invNorm_(row[wbCol0]);
-    if (wb && wbSet[wb] !== true) continue;
+    const rowSpec = invNorm_(row[specCol0]);
+    const allowedWbs = specMap[rowSpec];
+    if (!allowedWbs) continue;
+    const rowWb = invNorm_(row[wbCol0]);
+    if (rowWb && Object.keys(allowedWbs).length > 0 && allowedWbs[rowWb] !== true) continue;
     sh.getRange(INV_DATA_START_ROW + i, linkCol1).setValue(url);
     updated++;
   }
-  invLog_('INFO', 'Сводная обновлена', { updated: updated, linkCol: linkCol1 });
+  invLog_('INFO', 'Сводная обновлена', { updated: updated, linkCol: linkCol1, specs: Object.keys(specMap).length });
+}
+
+/**
+ * Тонкая обёртка над `invUpdateSummaryLinksMulti_` для совместимости со
+ * старыми вызовами по одной спецификации.
+ */
+function invUpdateSummaryLinks_(spec, wbArticles, url) {
+  const pairs = (wbArticles || []).map(function (wb) {
+    return { spec: spec, wb: wb };
+  });
+  return invUpdateSummaryLinksMulti_(pairs, url);
 }
 
 function invNextInvoiceNumber_() {
@@ -753,7 +1189,9 @@ function getSavedSellers() {
         name: invNorm_(s.name),
         address: invNorm_(s.address || ''),
         contacts: invNorm_(s.contacts || ''),
-        bank: invNorm_(s.bank || '')
+        bank: invNorm_(s.bank || ''),
+        contractNo: invNorm_(s.contractNo || ''),
+        contractDate: invNorm_(s.contractDate || '')
       });
     });
     return merged;
@@ -762,13 +1200,19 @@ function getSavedSellers() {
   }
 }
 
-function addSavedSeller(name, address, contacts, bank) {
+function addSavedSeller(name, address, contacts, bank, contractNo, contractDate) {
+  invRequireSellerEditor_();
   const safeName = invNorm_(name);
   if (!safeName) throw new Error('Название компании обязательно.');
 
   const safeAddress = invNorm_(address);
   const safeContacts = invNorm_(contacts);
   const safeBank = invNorm_(bank);
+  const safeContractNo = invNorm_(contractNo);
+  const safeContractDate = invNorm_(contractDate);
+
+  if (!safeContractNo) throw new Error('Номер контракта обязателен.');
+  if (!safeContractDate) throw new Error('Дата контракта обязательна.');
 
   const list = getSavedSellers().filter(function (s) {
     return s && invNorm_(s.name);
@@ -783,14 +1227,18 @@ function addSavedSeller(name, address, contacts, bank) {
       name: safeName,
       address: safeAddress,
       contacts: safeContacts,
-      bank: safeBank
+      bank: safeBank,
+      contractNo: safeContractNo,
+      contractDate: safeContractDate
     };
   } else {
     list.push({
       name: safeName,
       address: safeAddress,
       contacts: safeContacts,
-      bank: safeBank
+      bank: safeBank,
+      contractNo: safeContractNo,
+      contractDate: safeContractDate
     });
   }
 
@@ -798,7 +1246,56 @@ function addSavedSeller(name, address, contacts, bank) {
   return list;
 }
 
+/**
+ * Обновляет существующую запись по индексу (в порядке getSavedSellers()).
+ * Допускает переименование. Запрещает редактирование базовой (DEFAULT_SELLER) —
+ * она задана в коде.
+ */
+function updateSavedSeller(index, name, address, contacts, bank, contractNo, contractDate) {
+  invRequireSellerEditor_();
+  const all = getSavedSellers();
+  const idx = Number(index);
+  if (!isFinite(idx) || idx < 0 || idx >= all.length) {
+    throw new Error('Неверный индекс компании.');
+  }
+  if (idx === 0 && invCanon_(all[0].name) === invCanon_(DEFAULT_SELLER.name)) {
+    throw new Error('Базовую компанию редактировать нельзя — она задана в коде.');
+  }
+
+  const safeName = invNorm_(name);
+  if (!safeName) throw new Error('Название компании обязательно.');
+  const safeContractNo = invNorm_(contractNo);
+  if (!safeContractNo) throw new Error('Номер контракта обязателен.');
+  const safeContractDate = invNorm_(contractDate);
+  if (!safeContractDate) throw new Error('Дата контракта обязательна.');
+
+  for (let i = 0; i < all.length; i++) {
+    if (i === idx) continue;
+    if (invCanon_(all[i].name) === invCanon_(safeName)) {
+      throw new Error('Компания с таким названием уже есть в справочнике.');
+    }
+  }
+
+  const updated = {
+    name: safeName,
+    address: invNorm_(address || ''),
+    contacts: invNorm_(contacts || ''),
+    bank: invNorm_(bank || ''),
+    contractNo: safeContractNo,
+    contractDate: safeContractDate
+  };
+
+  const list = all.filter(function (s) {
+    return s && invNorm_(s.name);
+  });
+  list[idx] = updated;
+
+  PropertiesService.getDocumentProperties().setProperty('SAVED_SELLERS', JSON.stringify(list));
+  return list;
+}
+
 function deleteSavedSeller(index) {
+  invRequireSellerEditor_();
   const list = getSavedSellers().filter(function (s) {
     return s && invNorm_(s.name);
   });
@@ -811,7 +1308,7 @@ function deleteSavedSeller(index) {
 }
 
 function invShowSellersSettings() {
-  const html = HtmlService.createHtmlOutput(invSellersEditorHtml_()).setWidth(520).setHeight(420);
+  const html = HtmlService.createHtmlOutput(invSellersEditorHtml_()).setWidth(620).setHeight(640);
   SpreadsheetApp.getUi().showModalDialog(html, 'Компании (продавцы)');
 }
 
@@ -820,53 +1317,164 @@ function invShowSellersSettings_() {
 }
 
 function invSellersEditorHtml_() {
-  return (
-    '<!DOCTYPE html><html><head><base target="_top"><meta charset="utf-8">' +
-    '<style>body{font-family:Arial;padding:10px}textarea,input,select{width:100%;box-sizing:border-box}' +
-    'label{font-size:12px;color:#444}.list{margin-top:10px;font-size:12px;color:#333;max-height:140px;overflow:auto;border:1px solid #ddd;padding:8px}</style></head><body>' +
-    '<p>Добавление продавца в справочник документа.</p>' +
-    '<label>Название</label><input id="n">' +
-    '<label>Адрес</label><textarea id="a" rows="2"></textarea>' +
-    '<label>Контакты</label><textarea id="c" rows="2"></textarea>' +
-    '<label>Банк</label><textarea id="b" rows="2"></textarea>' +
-    '<div style="margin-top:8px;font-size:12px;color:#666">Текущий список компаний:</div>' +
-    '<div id="lst" class="list">Загрузка...</div>' +
-    '<label style="margin-top:8px;display:block;">Удалить компанию</label>' +
-    '<select id="delSeller"></select>' +
-    '<button onclick="add()">Добавить</button> <button onclick="delSeller()">Удалить выбранную</button> <button onclick="google.script.host.close()">Закрыть</button>' +
-    '<script>' +
-    'function esc(s){return String(s||\"\").replace(/&/g,\"&amp;\").replace(/</g,\"&lt;\").replace(/>/g,\"&gt;\");}' +
-    'function render(list){var sel=document.getElementById(\"delSeller\");sel.innerHTML=\"\";' +
-    'if(!list||!list.length){document.getElementById(\"lst\").innerHTML=\"(пусто)\";sel.innerHTML=\"<option value=\\\"\\\">(пусто)</option>\";return;}' +
-    'document.getElementById(\"lst\").innerHTML=list.map(function(x,i){return (i+1)+\". \"+esc(x.name||\"\");}).join(\"<br>\");' +
-    'list.forEach(function(x,i){var o=document.createElement(\"option\");o.value=String(i);o.text=(i+1)+\". \"+(x.name||\"\");sel.appendChild(o);});}' +
-    'function reload(){google.script.run.withSuccessHandler(render).withFailureHandler(function(e){document.getElementById(\"lst\").innerText=(e.message||e);}).getSavedSellers();}' +
-    'function add(){var p={name:document.getElementById("n").value,' +
-    'address:document.getElementById("a").value,contacts:document.getElementById("c").value,' +
-    'bank:document.getElementById("b").value};' +
-    'google.script.run.withSuccessHandler(function(msg){alert(msg||\"Сохранено\");reload();document.getElementById(\"n\").value=\"\";document.getElementById(\"a\").value=\"\";document.getElementById(\"c\").value=\"\";document.getElementById(\"b\").value=\"\";})' +
-    '.withFailureHandler(function(e){alert(e.message||e);}).invAddSellerUi(p);}' +
-    'function delSeller(){var v=document.getElementById(\"delSeller\").value;if(v===\"\"){alert(\"Нечего удалять\");return;}' +
-    'if(!confirm(\"Удалить выбранную компанию?\")){return;}' +
-    'google.script.run.withSuccessHandler(function(msg){alert(msg||\"Удалено\");reload();})' +
-    '.withFailureHandler(function(e){alert(e.message||e);}).invDeleteSellerUi(Number(v));}' +
-    'reload();' +
+  const styles = [
+    'body{font-family:Arial;padding:10px;margin:0}',
+    'textarea,input,select{width:100%;box-sizing:border-box}',
+    'label{font-size:12px;color:#444}',
+    '.req{color:#c62828}',
+    '.row2{display:flex;gap:8px}.row2>div{flex:1}',
+    '.list{margin-top:10px;font-size:12px;color:#333;max-height:160px;overflow:auto;border:1px solid #ddd;padding:8px}',
+    '.warn{color:#c62828}',
+    '.editingBadge{margin-top:6px;padding:6px 8px;background:#fff3cd;border:1px solid #ffeeba;color:#856404;font-size:12px;border-radius:4px}',
+    '.readonlyHint{margin:6px 0 10px;padding:8px;background:#e8f0fe;border:1px solid #c2d4f9;color:#1a3e8c;font-size:12px;border-radius:4px}',
+    '.actions{margin-top:8px;display:flex;flex-wrap:wrap;gap:6px}',
+    '.actions button{padding:6px 12px}',
+    'h3{margin:14px 0 6px;font-size:13px;color:#333}'
+  ].join('');
+
+  const html = [
+    '<!DOCTYPE html><html><head><base target="_top"><meta charset="utf-8">',
+    '<style>', styles, '</style></head><body>',
+
+    '<div id="readonlyHint" class="readonlyHint" style="display:none">',
+      'Режим просмотра. Редактирование справочника доступно только пользователю ',
+      '<b>', SELLER_EDITOR_EMAIL, '</b>. Вы вошли как <span id="curEmail">—</span>.',
+    '</div>',
+
+    '<div id="formBox" style="display:none">',
+      '<p style="margin:4px 0 8px">Карточка продавца. Поля со <span class="req">*</span> обязательны.</p>',
+      '<div id="editingBadge" class="editingBadge" style="display:none">Редактируется: <b><span id="editingName"></span></b></div>',
+      '<label>Название <span class="req">*</span></label><input id="n">',
+      '<label>Адрес</label><textarea id="a" rows="2"></textarea>',
+      '<label>Контакты</label><textarea id="c" rows="2"></textarea>',
+      '<label>Банк</label><textarea id="b" rows="2"></textarea>',
+      '<div class="row2" style="margin-top:6px">',
+        '<div><label>Номер контракта <span class="req">*</span></label><input id="cno" placeholder="например, BD-2025-001"></div>',
+        '<div><label>Дата контракта <span class="req">*</span></label><input id="cdt" type="date"></div>',
+      '</div>',
+      '<div class="actions">',
+        '<button id="saveBtn" onclick="save()">Добавить</button>',
+        '<button id="cancelEditBtn" onclick="cancelEdit()" style="display:none">Отмена редактирования</button>',
+        '<button onclick="resetForm()">Очистить форму</button>',
+      '</div>',
+    '</div>',
+
+    '<h3>Список компаний</h3>',
+    '<div id="lst" class="list">Загрузка...</div>',
+
+    '<div id="manageBox" style="display:none">',
+      '<div class="row2" style="margin-top:8px">',
+        '<div><label>Редактировать</label><select id="editSel" onchange="onPickEdit()"></select></div>',
+        '<div><label>Удалить</label><select id="delSeller"></select></div>',
+      '</div>',
+      '<div class="actions">',
+        '<button onclick="delSellerClick()">Удалить выбранную</button>',
+      '</div>',
+    '</div>',
+
+    '<div class="actions" style="margin-top:12px">',
+      '<button onclick="google.script.host.close()">Закрыть</button>',
+    '</div>',
+
+    '<script>',
+      'var _sellers=[];var _canEdit=false;var _editingIdx=null;',
+
+      'function esc(s){return String(s||"").replace(/&/g,"&amp;").replace(/</g,"&lt;").replace(/>/g,"&gt;");}',
+      'function fmtDate(s){s=String(s||"").trim();var m=s.match(/^(\\d{4})-(\\d{2})-(\\d{2})$/);if(m)return m[3]+"."+m[2]+"."+m[1];return s;}',
+      'function isoDate(s){s=String(s||"").trim();var m=s.match(/^(\\d{2})[.\\/-](\\d{2})[.\\/-](\\d{4})$/);if(m)return m[3]+"-"+m[2]+"-"+m[1];if(/^\\d{4}-\\d{2}-\\d{2}$/.test(s))return s;return "";}',
+
+      'function showReadonly(email){document.getElementById("curEmail").textContent=email||"неизвестен";document.getElementById("readonlyHint").style.display="block";document.getElementById("formBox").style.display="none";document.getElementById("manageBox").style.display="none";}',
+      'function showEditor(){document.getElementById("readonlyHint").style.display="none";document.getElementById("formBox").style.display="block";document.getElementById("manageBox").style.display="block";}',
+
+      'function renderList(){',
+        'var lst=document.getElementById("lst");',
+        'if(!_sellers.length){lst.innerHTML="(пусто)";}',
+        'else{lst.innerHTML=_sellers.map(function(x,i){',
+          'var meta=[];if(x.contractNo)meta.push("контракт "+esc(x.contractNo));if(x.contractDate)meta.push("от "+esc(fmtDate(x.contractDate)));',
+          'var miss=(!x.contractNo||!x.contractDate)?" <span class=\\"warn\\">(не заполнен контракт)</span>":"";',
+          'return (i+1)+". "+esc(x.name||"")+(meta.length?" — "+meta.join(", "):"")+miss;',
+        '}).join("<br>");}',
+        'if(!_canEdit)return;',
+        'var del=document.getElementById("delSeller");del.innerHTML="";',
+        'var edt=document.getElementById("editSel");edt.innerHTML="<option value=\\"\\\">— выберите для редактирования —</option>";',
+        '_sellers.forEach(function(x,i){',
+          'var label=(i+1)+". "+(x.name||"");',
+          'var od=document.createElement("option");od.value=String(i);od.text=label;del.appendChild(od);',
+          'if(i>0){var oe=document.createElement("option");oe.value=String(i);oe.text=label;edt.appendChild(oe);}',
+        '});',
+        'if(_editingIdx!=null)document.getElementById("editSel").value=String(_editingIdx);',
+      '}',
+
+      'function reload(){google.script.run.withSuccessHandler(function(list){_sellers=list||[];renderList();}).withFailureHandler(function(e){document.getElementById("lst").innerText=(e.message||e);}).getSavedSellers();}',
+
+      'function resetForm(){_editingIdx=null;["n","a","c","b","cno","cdt"].forEach(function(id){document.getElementById(id).value="";});document.getElementById("editingBadge").style.display="none";document.getElementById("saveBtn").textContent="Добавить";document.getElementById("cancelEditBtn").style.display="none";var es=document.getElementById("editSel");if(es)es.value="";}',
+      'function cancelEdit(){resetForm();}',
+
+      'function onPickEdit(){var v=document.getElementById("editSel").value;if(v===""){resetForm();return;}var idx=Number(v);var s=_sellers[idx];if(!s){resetForm();return;}_editingIdx=idx;document.getElementById("n").value=s.name||"";document.getElementById("a").value=s.address||"";document.getElementById("c").value=s.contacts||"";document.getElementById("b").value=s.bank||"";document.getElementById("cno").value=s.contractNo||"";document.getElementById("cdt").value=isoDate(s.contractDate);document.getElementById("editingName").textContent=s.name||"";document.getElementById("editingBadge").style.display="block";document.getElementById("saveBtn").textContent="Сохранить изменения";document.getElementById("cancelEditBtn").style.display="inline-block";}',
+
+      'function readPayload(){return{name:document.getElementById("n").value,address:document.getElementById("a").value,contacts:document.getElementById("c").value,bank:document.getElementById("b").value,contractNo:document.getElementById("cno").value,contractDate:document.getElementById("cdt").value};}',
+
+      'function save(){var p=readPayload();',
+        'if(!p.name||!p.name.trim()){alert("Укажите название.");return;}',
+        'if(!p.contractNo||!p.contractNo.trim()){alert("Укажите номер контракта.");return;}',
+        'if(!p.contractDate||!p.contractDate.trim()){alert("Укажите дату контракта.");return;}',
+        'var ok=function(msg){alert(msg||"Сохранено");resetForm();reload();};',
+        'var fail=function(e){alert(e.message||e);};',
+        'if(_editingIdx!=null){google.script.run.withSuccessHandler(ok).withFailureHandler(fail).invUpdateSellerUi(_editingIdx,p);}',
+        'else{google.script.run.withSuccessHandler(ok).withFailureHandler(fail).invAddSellerUi(p);}',
+      '}',
+
+      'function delSellerClick(){var v=document.getElementById("delSeller").value;if(v===""){alert("Нечего удалять");return;}if(!confirm("Удалить выбранную компанию?")){return;}google.script.run.withSuccessHandler(function(msg){alert(msg||"Удалено");resetForm();reload();}).withFailureHandler(function(e){alert(e.message||e);}).invDeleteSellerUi(Number(v));}',
+
+      'function init(){google.script.run.withSuccessHandler(function(can){_canEdit=!!can;if(_canEdit){showEditor();}else{google.script.run.withSuccessHandler(function(email){showReadonly(email);}).invCurrentUserEmailForUi();}reload();}).withFailureHandler(function(e){document.getElementById("lst").innerText=(e.message||e);}).invCanEditSellers();}',
+
+      'init();',
     '</script></body></html>'
-  );
+  ].join('');
+
+  return html;
+}
+
+/** Возвращает текущий email активного пользователя — для отображения в UI. */
+function invCurrentUserEmailForUi() {
+  return invCurrentUserEmail_() || '';
 }
 
 function invAddSellerUi(payload) {
+  invRequireSellerEditor_();
   if (!payload || !invNorm_(payload.name)) throw new Error('Укажите название.');
+  if (!invNorm_(payload.contractNo)) throw new Error('Укажите номер контракта.');
+  if (!invNorm_(payload.contractDate)) throw new Error('Укажите дату контракта.');
   const list = addSavedSeller(
     payload.name,
     payload.address || '',
     payload.contacts || '',
-    payload.bank || ''
+    payload.bank || '',
+    payload.contractNo || '',
+    payload.contractDate || ''
   );
   return 'Компания сохранена. Всего в справочнике: ' + list.length;
 }
 
+function invUpdateSellerUi(index, payload) {
+  invRequireSellerEditor_();
+  if (!payload || !invNorm_(payload.name)) throw new Error('Укажите название.');
+  if (!invNorm_(payload.contractNo)) throw new Error('Укажите номер контракта.');
+  if (!invNorm_(payload.contractDate)) throw new Error('Укажите дату контракта.');
+  const list = updateSavedSeller(
+    index,
+    payload.name,
+    payload.address || '',
+    payload.contacts || '',
+    payload.bank || '',
+    payload.contractNo || '',
+    payload.contractDate || ''
+  );
+  return 'Компания обновлена. Всего в справочнике: ' + list.length;
+}
+
 function invDeleteSellerUi(index) {
+  invRequireSellerEditor_();
   const listBefore = getSavedSellers();
   if (!listBefore.length) return 'Список пуст.';
   deleteSavedSeller(index);

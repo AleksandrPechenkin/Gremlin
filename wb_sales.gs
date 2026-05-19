@@ -320,7 +320,7 @@ function wbFetchCurrentMonthSalesViaAnalytics_(needWb, needBc) {
       else qty = orderCount;
       if (!(qty > 0)) continue;
 
-      const nm = product.nmId != null ? ppCanonArticle_(String(product.nmId)) : '';
+      const nm = product.nmId != null ? ppCanonWbArticleKey_(String(product.nmId)) : '';
       const sa = product.vendorCode != null ? ppCanonArticle_(String(product.vendorCode)) : '';
       if (nm && needWb[nm]) byWb[nm] = (byWb[nm] || 0) + qty;
       if (sa && needWb[sa]) byWb[sa] = (byWb[sa] || 0) + qty;
@@ -370,7 +370,7 @@ function wbFetchCurrentMonthSalesViaStatistics_(needWb, needBc) {
     for (let i = 0; i < rows.length; i++) {
       const r = rows[i];
       const qty = wbSalesQty_(r);
-      const nm = r.nmId != null ? ppCanonArticle_(String(r.nmId)) : '';
+      const nm = r.nmId != null ? ppCanonWbArticleKey_(String(r.nmId)) : '';
       const sa = r.supplierArticle != null ? ppCanonArticle_(String(r.supplierArticle)) : '';
       const bc = r.barcode != null ? ppCanonBarcodeForStock_(String(r.barcode)) : '';
       if (nm) allByWb[nm] = (allByWb[nm] || 0) + qty;

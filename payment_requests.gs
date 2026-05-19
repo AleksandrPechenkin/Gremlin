@@ -16,6 +16,7 @@ function addPaymentRegistryMenu_(ui) {
     .addItem('2) Проверка/отправка в реестр', 'payOpenApprovalDialog')
     .addSeparator()
     .addItem('3) Синхронизировать оплаченные', 'paySyncPaidStatuses')
+    .addItem('4) Обновить шапки листов менеджера (3 типа заявок)', 'payMigrateManagerHeadersForPaymentTypes')
     .addToUi();
 }
 
@@ -721,7 +722,7 @@ function payApproveQueueRow(queueRow) {
   sh.getRange(queueRow, 19).setValue('');
 
   sh.getRange(queueRow, 14).setValue(finalFolderUrl);
-  payWriteRequestToManagerAndSummary_(managerSheet, managerName, spec, managerRows, reqNo, finalFolderUrl);
+  payWriteRequestToManagerAndSummary_(managerSheet, managerName, spec, managerRows, reqNo, finalFolderUrl, paymentType);
 
   // Авто-пометка дублей этой же заявки в очереди, чтобы они не висели "На проверке".
   const allLast = sh.getLastRow();
@@ -794,37 +795,106 @@ function payExtractDriveFileId_(url) {
   return null;
 }
 
-function payWriteRequestToManagerAndSummary_(managerSheetName, managerName, spec, managerRows, requestNo, folderUrl) {
+/**
+ * Пишет результат одобренной заявки на лист менеджера.
+ *
+ * Что делает:
+ *  • Колонки AB/AC («Номер заявки» / «Ссылка на заявку») — обновляются как «последняя
+ *    поданная заявка по строке» (поведение совместимо со старыми листами).
+ *  • Дополнительно: в пару колонок «<Тип> № заявки» / «<Тип> ссылка» — зависит от
+ *    paymentType (Аванс / Баланс / Отсрочка). Если этих колонок нет — создаст справа.
+ *    Так на одной строке видно все три заявки и три ссылки на документы.
+ *
+ * В `Сводная` НЕ пишем сознательно: лист пересобирается автоматически из листов
+ * менеджеров (см. `main.gs`). Запись в неё номера заявки/ссылки в AG/AH ранее
+ * затирала «Период (MM/YY)» и «Плановая дата поступления» и ломала планирование.
+ */
+function payWriteRequestToManagerAndSummary_(managerSheetName, managerName, spec, managerRows, requestNo, folderUrl, paymentType) {
   const ss = SpreadsheetApp.getActiveSpreadsheet();
   const mgr = ss.getSheetByName(managerSheetName);
-  if (mgr && managerRows && managerRows.length) {
-    managerRows.forEach(function (r) {
-      mgr.getRange(r, 28).setValue(requestNo); // AB
-      mgr.getRange(r, 29).setValue(folderUrl); // AC
-    });
-  }
+  if (!mgr || !managerRows || !managerRows.length) return;
 
-  const sumSh = ss.getSheetByName(PAY_CFG.SUMMARY_SHEET);
-  if (!sumSh) return;
-  const last = sumSh.getLastRow();
-  if (last < PAY_CFG.DATA_START_ROW) return;
-  const data = sumSh.getRange(PAY_CFG.DATA_START_ROW, 1, last - PAY_CFG.DATA_START_ROW + 1, 34).getValues();
-  for (let i = 0; i < data.length; i++) {
-    const row = data[i];
-    const sumSpec = payNorm_(row[11]); // L
-    const sumManager = payNorm_(row[7]); // H
-    if (sumSpec !== payNorm_(spec)) continue;
-    if (payCanon_(sumManager) !== payCanon_(managerName)) continue;
-    const abs = PAY_CFG.DATA_START_ROW + i;
-    sumSh.getRange(abs, 33).setValue(requestNo); // AG
-    sumSh.getRange(abs, 34).setValue(folderUrl); // AH
+  const ptCols = payEnsurePaymentTypeColumns_(mgr, paymentType);
+  managerRows.forEach(function (r) {
+    mgr.getRange(r, 28).setValue(requestNo); // AB — последняя заявка
+    mgr.getRange(r, 29).setValue(folderUrl); // AC — последняя ссылка
+    if (ptCols) {
+      mgr.getRange(r, ptCols.noCol).setValue(requestNo);
+      mgr.getRange(r, ptCols.linkCol).setValue(folderUrl);
+    }
+  });
+}
+
+/**
+ * Гарантирует наличие пары колонок «<Тип> № заявки» / «<Тип> ссылка» в шапке листа
+ * менеджера (строка PAY_CFG.HEADER_ROW). Возвращает {noCol, linkCol} 1-based.
+ *
+ * Поиск устойчив к разным написаниям через `payHeaderCanon_` (см. PAY_PT_ALIASES).
+ * Если колонок нет — добавляет их справа от текущей последней колонки. Создание
+ * происходит атомарно для типа: сначала «№», следом «ссылка», чтобы соседи всегда
+ * стояли парой и порядок типов не зависел от порядка одобрений.
+ */
+function payEnsurePaymentTypeColumns_(sheet, paymentType) {
+  const key = payCanon_(paymentType);
+  const aliases = PAY_PT_ALIASES[key];
+  if (!aliases) return null;
+  const headerRow = PAY_CFG.HEADER_ROW;
+  const lastCol = Math.max(sheet.getLastColumn(), 1);
+  const headers = sheet.getRange(headerRow, 1, 1, lastCol).getValues()[0];
+  const map = payHeaderMap_(headers);
+  let noCol = payFindHeaderCol_(map, aliases.no);
+  let linkCol = payFindHeaderCol_(map, aliases.link);
+
+  // Колонок нет — допишем справа.
+  let writeAt = lastCol;
+  if (noCol < 0) {
+    writeAt += 1;
+    sheet.getRange(headerRow, writeAt).setValue(aliases.no[0]).setFontWeight('bold');
+    noCol = writeAt - 1; // переведём обратно в 0-based для единообразия
+  }
+  if (linkCol < 0) {
+    writeAt += 1;
+    sheet.getRange(headerRow, writeAt).setValue(aliases.link[0]).setFontWeight('bold');
+    linkCol = writeAt - 1;
+  }
+  return { noCol: noCol + 1, linkCol: linkCol + 1 };
+}
+
+const PAY_PT_ALIASES = {
+  'аванс': {
+    no: ['Аванс № заявки', 'Аванс №', 'Аванс номер заявки', 'Аванс заявка'],
+    link: ['Аванс ссылка', 'Аванс папка', 'Аванс ссылка на заявку']
+  },
+  'баланс': {
+    no: ['Баланс № заявки', 'Баланс №', 'Баланс номер заявки', 'Баланс заявка'],
+    link: ['Баланс ссылка', 'Баланс папка', 'Баланс ссылка на заявку']
+  },
+  'отсрочка': {
+    no: ['Отсрочка № заявки', 'Отсрочка №', 'Отсрочка номер заявки', 'Отсрочка заявка'],
+    link: ['Отсрочка ссылка', 'Отсрочка папка', 'Отсрочка ссылка на заявку']
+  }
+};
+
+function paySyncPaidStatuses() {
+  const r = paySyncPaidStatusesImpl_({});
+  if (r && r.message && !r.silent) {
+    SpreadsheetApp.getUi().alert(r.message);
   }
 }
 
-function paySyncPaidStatuses() {
+/**
+ * @param {{ silent?: boolean }} opt
+ * @returns {{ updated: number, message: string, silent: boolean }}
+ */
+function paySyncPaidStatusesImpl_(opt) {
+  const silent = !!(opt && opt.silent);
   const sh = payEnsureQueueSheet_();
   const last = sh.getLastRow();
-  if (last < 2) return SpreadsheetApp.getUi().alert('Нет заявок для синхронизации.');
+  if (last < 2) {
+    const msg = 'Нет заявок для синхронизации.';
+    if (!silent) return { updated: 0, message: msg, silent: false };
+    return { updated: 0, message: msg, silent: true };
+  }
   const rows = sh.getRange(2, 1, last - 1, 19).getValues();
   const registryId = payGetProp_('PAYMENT_REGISTRY_SPREADSHEET_ID', PAY_CFG.REGISTRY_ID_DEFAULT);
   const registrySheetName = payGetProp_('PAYMENT_REGISTRY_SHEET_NAME', PAY_CFG.REGISTRY_SHEET_DEFAULT);
@@ -858,39 +928,77 @@ function paySyncPaidStatuses() {
     sh.getRange(i + 2, 16).setValue('Оплачено (синхр.)');
     updated++;
   }
-  SpreadsheetApp.getUi().alert('Синхронизация завершена. Обновлено заявок: ' + updated);
+  const msg = 'Синхронизация завершена. Обновлено заявок: ' + updated;
+  return { updated: updated, message: msg, silent: silent };
 }
 
+/**
+ * Проставляет дату факта оплаты на лист менеджера.
+ *
+ * Колонки на листе менеджера (книга «01_Операционка», шапка строки 2):
+ *   S(19) — «Дата факт Аванс», V(22) — «Дата Факт Баланс», Y(25) — «Дата Факт Отсрочка».
+ * Эти позиции выверены по реальной разметке, не менять без обновления здесь.
+ *
+ * В `Сводная` сознательно не пишем: лист пересобирается автоматически и тянет
+ * даты факта с листов менеджеров (см. `main.gs`). Ранее запись `folderUrl` в
+ * Сводная!AH затирала «Плановая дата поступления» и ломала планирование.
+ *
+ * `folderUrl` дополнительно прокатываем в пару колонок по типу платежа, чтобы
+ * на одной строке менеджера были видны три комплекта ссылок одновременно.
+ */
 function payApplyFactDate_(managerSheetName, managerName, spec, managerRows, paymentType, paidDate, folderUrl) {
   const ss = SpreadsheetApp.getActiveSpreadsheet();
   const mgr = ss.getSheetByName(managerSheetName);
-  let mgrCol = 19; // S
-  let sumCol = 22; // V
-  if (payCanon_(paymentType) === payCanon_('Баланс')) {
-    mgrCol = 22; // V
-    sumCol = 25; // Y
-  } else if (payCanon_(paymentType) === payCanon_('Отсрочка')) {
-    mgrCol = 25; // Y
-    sumCol = 28; // AB
-  }
-  if (mgr && managerRows && managerRows.length) {
-    managerRows.forEach(function (r) {
-      mgr.getRange(r, mgrCol).setValue(paidDate);
-      if (folderUrl) mgr.getRange(r, 29).setValue(folderUrl); // AC
-    });
-  }
+  if (!mgr || !managerRows || !managerRows.length) return;
 
-  const sumSh = ss.getSheetByName(PAY_CFG.SUMMARY_SHEET);
-  if (!sumSh) return;
-  const last = sumSh.getLastRow();
-  if (last < PAY_CFG.DATA_START_ROW) return;
-  const data = sumSh.getRange(PAY_CFG.DATA_START_ROW, 1, last - PAY_CFG.DATA_START_ROW + 1, 34).getValues();
-  for (let i = 0; i < data.length; i++) {
-    const row = data[i];
-    if (payNorm_(row[11]) !== payNorm_(spec)) continue; // L spec
-    if (payCanon_(row[7]) !== payCanon_(managerName)) continue; // H manager
-    const abs = PAY_CFG.DATA_START_ROW + i;
-    sumSh.getRange(abs, sumCol).setValue(paidDate);
-    if (folderUrl) sumSh.getRange(abs, 34).setValue(folderUrl); // AH
+  let mgrCol = 19; // S — Дата факт Аванс
+  if (payCanon_(paymentType) === payCanon_('Баланс')) mgrCol = 22; // V
+  else if (payCanon_(paymentType) === payCanon_('Отсрочка')) mgrCol = 25; // Y
+
+  const ptCols = payEnsurePaymentTypeColumns_(mgr, paymentType);
+  managerRows.forEach(function (r) {
+    mgr.getRange(r, mgrCol).setValue(paidDate);
+    if (folderUrl) {
+      mgr.getRange(r, 29).setValue(folderUrl); // AC — последняя ссылка
+      if (ptCols) mgr.getRange(r, ptCols.linkCol).setValue(folderUrl);
+    }
+  });
+}
+
+/**
+ * Разовая миграция: на всех менеджерских листах (имя вида «Имя MM/YY») гарантирует
+ * наличие шести колонок справа от текущего конца листа:
+ *   Аванс № заявки | Аванс ссылка | Баланс № заявки | Баланс ссылка | Отсрочка № заявки | Отсрочка ссылка.
+ *
+ * Безопасно прогонять повторно: колонки находятся по канонизированным заголовкам,
+ * пары добавляются только если их нет. Уже заполненные данные не трогаются.
+ */
+function payMigrateManagerHeadersForPaymentTypes() {
+  const ss = SpreadsheetApp.getActiveSpreadsheet();
+  const sheets = ss.getSheets();
+  const summary = { processed: 0, added: 0, sheets: [] };
+
+  sheets.forEach(function (sh) {
+    const name = sh.getName();
+    if (payManagerNameFromSheet_(name) === payNorm_(name)) return;
+    const beforeCols = sh.getLastColumn();
+    payEnsurePaymentTypeColumns_(sh, 'Аванс');
+    payEnsurePaymentTypeColumns_(sh, 'Баланс');
+    payEnsurePaymentTypeColumns_(sh, 'Отсрочка');
+    const afterCols = sh.getLastColumn();
+    summary.processed += 1;
+    summary.added += Math.max(0, afterCols - beforeCols);
+    summary.sheets.push(name + ' (+' + Math.max(0, afterCols - beforeCols) + ')');
+  });
+
+  if (!summary.processed) {
+    SpreadsheetApp.getUi().alert('Не нашёл листов менеджеров (формат имени «Имя MM/YY»).');
+    return;
   }
+  SpreadsheetApp.getUi().alert(
+    'Шапки обновлены.\n' +
+    'Листов обработано: ' + summary.processed + '\n' +
+    'Колонок добавлено суммарно: ' + summary.added + '\n\n' +
+    summary.sheets.join('\n')
+  );
 }

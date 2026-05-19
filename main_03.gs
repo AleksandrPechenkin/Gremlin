@@ -7,6 +7,7 @@
 function onOpen() {
   const ui = SpreadsheetApp.getUi();
   ui.createMenu('Планирование закупок')
+    .addItem('Задать глубину планирования (горизонт месяцев)…', 'setProcurementPlanningHorizon')
     .addItem('Подтянуть планы продаж на лист «Планирование закупок»', 'refreshProcurementPlanningFromSalesSheets')
     .addItem('Диагностика книги планов (какие колонки реально нашёл скрипт)', 'diagnoseProcurementPlanningSourceSheets')
     .addItem('Обновить лист «Склады МС (остатки)» из МойСклад', 'syncMsStockStoresSheet')
