@@ -20,4 +20,9 @@
 
 ## Manual verification (owner)
 
-- [ ] T008 Run dry-run and live chain per [quickstart.md](./quickstart.md) in Google Sheets
+- [x] T008 Run dry-run and live chain per [quickstart.md](./quickstart.md) in Google Sheets (2026-05-19: SYNC_LOG OK, 343×52 / 2 движения / 0 новых партий)
+
+## Post-verify (Spec Kit)
+
+- [ ] T009 Merge branch `001-sync-chain-04` into `main`
+- [ ] T010 Adopt playbook: [operations registry](../../000-gremlin-sync-blocks/OPERATIONS.md) — use chain only, avoid duplicate 01→02
