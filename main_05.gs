@@ -30,6 +30,9 @@ function gremlinBuildMenus05_() {
   if (typeof addCostingCustomsMenu_ === 'function') {
     addCostingCustomsMenu_(ui);
   }
+  if (typeof addCostingReceiptMenu_ === 'function') {
+    addCostingReceiptMenu_(ui);
+  }
   if (typeof addPaymentLogisticsMenu_ === 'function') {
     addPaymentLogisticsMenu_(ui);
   }

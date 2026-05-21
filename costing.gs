@@ -29,7 +29,12 @@ const COST_CFG = {
     SUPPLIERS_REF: 'Справочник поставщики и условия',
     DECL_LINES: 'Декларации_строки',
     DECL_JOURNAL: 'Декларации_журнал',
-    COST_SKU_FACT: 'Факт_себестоимость SKU'
+    COST_SKU_FACT: 'Факт_себестоимость SKU',
+    PLAN_FACT_COMPARE: 'Сверка план vs факт',
+    RECEIPT_JOURNAL: 'Приемка_журнал',
+    RECEIPT_LINES: 'Приемка_строки',
+    RECEIPT_DISC: 'Расхождения_приемки',
+    RECEIPT_MAPPING: 'Справочник_маппинг_3PL'
   },
   DECL_LINES_HEADER: [
     'Загрузка_ID', 'Загрузка_время', 'SHIPMENT_ID', 'Номер_ГТД', 'Дата_ГТД',
@@ -74,7 +79,7 @@ function addCostingMenu_(ui) {
     .addSeparator()
     .addItem('🧪 Dry-run факт (по рейсу)', 'costingDryRunFactPrompt_')
     .addItem('✅ Пересчитать фактическую себестоимость', 'rebuildCostingFact_')
-    .addItem('📊 Сверка план vs факт', 'costingComparePlanFactPrompt_')
+    .addItem('📊 Обновить лист «Сверка план vs факт»', 'costingComparePlanFactPrompt_')
     .addSeparator()
     .addItem('Создать недостающие листы', 'costingEnsureSheets_')
     .addToUi();
@@ -118,6 +123,10 @@ function costingEnsureSheets_() {
   costingEnsureDeclJournalSheet_(ss);
   costingEnsureCustomsFactColumns_(ss);
   costingEnsureFactCostSkuHeader_(ss);
+  costingEnsurePlanFactCompareSheet_(ss);
+  if (typeof costingReceiptEnsureSheets_ === 'function') {
+    costingReceiptEnsureSheets_(ss);
+  }
   SpreadsheetApp.getUi().alert(
     'Готово',
     created ? ('Создано листов: ' + created) : 'Все обязательные листы уже существуют.',
@@ -141,7 +150,7 @@ function costingSyncRefsFrom04_() {
 function costingDryRun_() {
   try {
     costingHealthCheckCore_();
-    const report = costingBuildSkuCostRows_();
+    const report = costingBuildSkuCostRows_(null, { writeTripExpenseFx: false });
     SpreadsheetApp.getUi().alert(
       '🧪 Dry-run себестоимости',
       'Будет записано строк: ' + report.rows.length + '\n' +
@@ -165,7 +174,7 @@ function costingDryRunByShipmentPrompt_() {
   if (res.getSelectedButton() !== ui.Button.OK) return;
   const shipmentId = String(res.getResponseText() || '').trim();
   if (!shipmentId) throw new Error('SHIPMENT_ID не указан.');
-  const report = costingBuildSkuCostRows_(shipmentId);
+  const report = costingBuildSkuCostRows_(shipmentId, { writeTripExpenseFx: false });
   ui.alert(
     '🧪 Dry-run по рейсу',
     'SHIPMENT_ID: ' + shipmentId + '\n' +
@@ -200,11 +209,14 @@ function rebuildCosting_() {
     if (report.rows.length) {
       sh.getRange(2, 1, report.rows.length, header[0].length).setValues(report.rows);
     }
+    const fxMsg = report.tripExpenseFxFilled
+      ? ('\nПодставлено курсов в «Затраты рейса» (PLAN): ' + report.tripExpenseFxFilled)
+      : '';
     SpreadsheetApp.getUi().alert(
       '✅ Пересчет завершен',
       'Записано строк: ' + report.rows.length + '\n' +
       'SKU: ' + report.skuCount + '\n' +
-      'Рейсов: ' + report.shipmentCount,
+      'Рейсов: ' + report.shipmentCount + fxMsg,
       SpreadsheetApp.getUi().ButtonSet.OK
     );
   } catch (e) {
@@ -254,7 +266,9 @@ function costingBuildFullOutputHeader_(extraCols) {
   ].concat(extraCols || []).concat([
     'Итого_доп_расходы_RUB',
     'Итого_партия_руб',
-    'Себестоимость_ед_руб'
+    'Себестоимость_ед_руб',
+    'Курс_средневзв_RUB',
+    'FX_источник'
   ]);
 }
 
@@ -362,11 +376,11 @@ function rebuildCostingSummary_() {
   }
 }
 
-function costingBuildSkuCostRows_(shipmentFilter) {
+function costingBuildSkuCostRows_(shipmentFilter, options) {
   const ss = SpreadsheetApp.getActiveSpreadsheet();
   const sh = costingFindSheetByRole_(ss, 'ALLOCATION');
   if (!sh) {
-    return costingBuildSkuCostRowsFromBatchesAndExpenses_(ss, shipmentFilter);
+    return costingBuildSkuCostRowsFromBatchesAndExpenses_(ss, shipmentFilter, options);
   }
   const data = sh.getDataRange().getValues();
   if (data.length < 2) {
@@ -450,6 +464,7 @@ function costingBuildSkuCostRowsFromBatchesAndExpenses_(ss, shipmentFilter, opti
   options = options || {};
   const scenarioMode = String(options.scenarioMode || 'PLAN').toUpperCase();
   const isFact = scenarioMode === 'FACT';
+  const writeTripExpenseFx = options.writeTripExpenseFx !== false;
   const batchesSh = costingGetSheetByRole_(ss, 'BATCHES');
   const expensesSh = costingGetSheetByRole_(ss, 'TRIP_EXPENSES');
   const batchesData = batchesSh.getDataRange().getValues();
@@ -461,12 +476,17 @@ function costingBuildSkuCostRowsFromBatchesAndExpenses_(ss, shipmentFilter, opti
   const idxSku = costingFindCol_(bh, ['Артикул ВБ', 'Артикул_ВБ', 'WB_ARTICLE']);
   const idxSupplierArticle = costingFindColOptional_(bh, ['Артикул поставщика', 'Артикул_поставщика']);
   const idxQty = costingFindCol_(bh, ['Количество', 'Qty', 'QTY']);
+  const idxAllocQty = costingFindColOptional_(bh, [
+    'Qty_для_аллокации', 'Qty для аллокации', 'Количество_для_аллокации'
+  ]);
   const idxCost = costingFindColOptional_(bh, ['Стоимость', 'Закупка_руб', 'Закупка руб']);
   const idxPrice = costingFindColOptional_(bh, ['Цена', 'Цена_RUB', 'Цена руб']);
   const idxCurrency = costingFindColOptional_(bh, ['Валюта', 'Currency']);
-  // Курс_к_RUB из строки специально НЕ читаем: пересчёт всегда тянет курс ЦБ на дату прогона
-  // (через fxCache, один запрос на валюту). Утилита «🛠 Подставить курсы ЦБ в пустые Курс_к_RUB»
-  // заполняет это поле только для аудита/документации в листе «Партии_в_рейсе».
+  const idxRate = costingFindColOptional_(bh, ['Курс_к_RUB', 'Курс к RUB', 'Курс', 'Rate']);
+  const idxSpec = costingFindColOptional_(bh, [
+    'Номер спецификации', 'Номер_спецификации', 'Спецификация', '№ спецификации', '№спецификации',
+    'Spec', 'Spec number', 'Номер инвойса', 'Инвойс'
+  ]);
   const idxTnved = costingFindColOptional_(bh, ['Код ТН ВЭД', 'ТН ВЭД', 'ТНВЭД', 'TNVED', 'HS CODE', 'HS_CODE']);
   const idxShipVia = costingFindColOptional_(bh, ['Отгрузка через', 'Отгрузка_через', 'Поставщик', 'Supplier']);
   const idxVolume = costingFindColOptional_(bh, ['Объем', 'Объём', 'Volume']);
@@ -475,13 +495,16 @@ function costingBuildSkuCostRowsFromBatchesAndExpenses_(ss, shipmentFilter, opti
   const vatRatesByTnved = costingLoadVatRatesByTnved_(ss);
   const customsFeeRules = costingLoadCustomsFeeRules_(ss);
   const skuToTnved = costingLoadSkuToTnvedMap_(ss);
-  // Один кэш курсов ЦБ на весь пересчёт: ровно один запрос на валюту.
-  // Это лечит ситуацию, когда часть строк получала курс CBR, а соседние —
-  // молчаливую единицу из-за моргнувшего UrlFetchApp.
+  const paymentLoad = costingLoadPaymentTranchesMapSafe_(shipmentFilter);
+  const paymentMap = paymentLoad.map || {};
   const fxCache = costingMakeFxCache_(new Date());
+  const fxMissing = [];
 
   const expensePoolsByShipment = {};
   const expensePoolsByShipmentSupplier = {};
+  const skippedFactExpenses = [];
+  const tripExpenseFxUpdates = [];
+  let tripExpenseFxFilled = 0;
   // Какие ALLOC_BASE реально использовались — для последующей валидации (где у SKU нулевая база — ошибка).
   const baseUsageByShipment = {};
   const baseUsageByShipmentSupplier = {};
@@ -489,26 +512,75 @@ function costingBuildSkuCostRowsFromBatchesAndExpenses_(ss, shipmentFilter, opti
     const eh = expensesData[0];
     const eShipment = costingFindCol_(eh, ['SHIPMENT_ID', 'ID_рейса']);
     const eScenario = costingFindColOptional_(eh, ['Сценарий']);
-    const eInSku = costingFindColOptional_(eh, ['IN_SKU_COST']);
+    const eInSku = costingFindColOptional_(eh, ['IN_SKU_COST', 'IN SKU COST']);
     const eSumRub = costingFindColOptional_(eh, ['Сумма_RUB', 'Сумма RUB']);
-    const eSum = costingFindColOptional_(eh, ['Сумма']);
+    const eSum = costingFindColOptional_(eh, [
+      'Сумма_в_валюте', 'Сумма в валюте', 'Сумма', 'Amount'
+    ]);
+    const eCurrency = costingFindColOptional_(eh, ['Валюта', 'Currency']);
+    const eRate = costingFindColOptional_(eh, ['Курс_к_RUB', 'Курс к RUB', 'Курс', 'Rate']);
+    const ePayDate = costingFindColOptional_(eh, [
+      'Дата оплаты', 'Дата_оплаты', 'Дата оплаты (факт)', 'Дата_оплаты_факт'
+    ]);
+    const eExpenseDate = costingFindColOptional_(eh, [
+      'Дата_расхода', 'Дата расхода', 'Дата_затраты', 'Дата затраты',
+      'Дата_события', 'Дата события', 'Дата'
+    ]);
     const eOnlyShipVia = costingFindColOptional_(eh, ['Только_отгрузка_через', 'Только отгрузка через']);
     const eAllocBase = costingFindColOptional_(eh, ['ALLOC_BASE', 'Alloc base', 'AllocBase', 'База_аллокации', 'База аллокации']);
+    const expenseFxCols = {
+      sumRub: eSumRub,
+      sum: eSum,
+      currency: eCurrency,
+      rate: eRate,
+      payDate: ePayDate,
+      expenseDate: eExpenseDate
+    };
     for (let i = 1; i < expensesData.length; i++) {
       const r = expensesData[i];
       const shipmentId = String(r[eShipment] || '').trim();
       if (!shipmentId) continue;
       if (shipmentFilter && shipmentId !== shipmentFilter) continue;
-      if (eScenario != null) {
-        const sc = String(r[eScenario] || '').trim().toUpperCase();
-        if (isFact ? sc !== 'FACT' : sc === 'FACT') continue;
-      }
-      const sumRub = eSumRub != null ? costingToNumber_(r[eSumRub]) : costingToNumber_(r[eSum]);
-      if (!sumRub) continue;
       const article = costingCellText_(r, costingFindColOptional_(eh, ['Статья_затрат', 'Статья затрат', 'Статья']));
       const eventType = costingCellText_(r, costingFindColOptional_(eh, ['Тип_событий', 'Тип события']));
       const scope = costingCellText_(r, costingFindColOptional_(eh, ['COST_SCOPE', 'Scope']));
       const cat = costingClassifyExpense_(article, eventType, scope);
+      let expenseScenario = '';
+      if (eScenario != null) {
+        expenseScenario = String(r[eScenario] || '').trim().toUpperCase();
+        if (isFact) {
+          // Фактический пересчёт: только строки FACT. Таможня по SKU — из «Таможенные платежи» (XML).
+          if (expenseScenario !== 'FACT') continue;
+        } else if (expenseScenario === 'FACT') {
+          continue;
+        }
+      }
+      const fxDetail = costingResolveTripExpenseRubDetail_(r, expenseFxCols, fxCache, fxMissing, {
+        shipmentId: shipmentId,
+        sku: '(затраты рейса)',
+        supplierArticle: article
+      });
+      if (!(fxDetail.sumRub > 0)) {
+        if (isFact && expenseScenario === 'FACT') {
+          skippedFactExpenses.push(
+            shipmentId + ' / ' + (article || '(без статьи)') +
+            ': не удалось получить сумму в RUB (Сумма_в_валюте, валюта, Дата_расхода; курс ЦБ, если Курс_к_RUB пуст)'
+          );
+        }
+        continue;
+      }
+      const sumRub = fxDetail.sumRub;
+      if (writeTripExpenseFx && (fxDetail.fillRate || fxDetail.fillSumRub)) {
+        tripExpenseFxUpdates.push({
+          row: i,
+          rateCol: eRate,
+          sumRubCol: eSumRub,
+          rate: fxDetail.rate,
+          sumRub: fxDetail.sumRub,
+          fillRate: fxDetail.fillRate,
+          fillSumRub: fxDetail.fillSumRub
+        });
+      }
       const onlyShipViaRaw = eOnlyShipVia != null ? String(r[eOnlyShipVia] || '') : '';
       const onlyShipViaKey = costingNormalizeSupplierKey_(onlyShipViaRaw);
       const allocBase = costingNormalizeAllocBase_(eAllocBase != null ? r[eAllocBase] : '');
@@ -553,6 +625,9 @@ function costingBuildSkuCostRowsFromBatchesAndExpenses_(ss, shipmentFilter, opti
         targetPool.otherByArticle[key][allocBase] = (targetPool.otherByArticle[key][allocBase] || 0) + sumRub;
       }
     }
+    if (writeTripExpenseFx && tripExpenseFxUpdates.length) {
+      tripExpenseFxFilled = costingApplyTripExpenseFxFill_(expensesSh, tripExpenseFxUpdates);
+    }
   }
 
   // Плановый контур: агрегат таможни по рейсу (без FACT). Факт — по SKU из «Таможенные платежи» ниже.
@@ -583,10 +658,6 @@ function costingBuildSkuCostRowsFromBatchesAndExpenses_(ss, shipmentFilter, opti
   // Тоталы по каждой ALLOC_BASE — нужны для расчёта долей при аллокации.
   const baseTotalsByShipment = {};
   const baseTotalsByShipmentSupplier = {};
-  // Список строк, у которых не удалось получить курс к RUB (валюта без Курс_к_RUB и ЦБ молчит).
-  // Накапливаем и кидаем единое читаемое исключение после прохода — чтоб пользователь
-  // увидел все проблемные SKU за один раз, а не починил одну и снова запустил.
-  const fxMissing = [];
 
   for (let i = 1; i < batchesData.length; i++) {
     const r = batchesData[i];
@@ -594,30 +665,31 @@ function costingBuildSkuCostRowsFromBatchesAndExpenses_(ss, shipmentFilter, opti
     const sku = String(r[idxSku] || '').trim();
     if (!shipmentId || !sku) continue;
     if (shipmentFilter && shipmentId !== shipmentFilter) continue;
-    const qty = costingToNumber_(r[idxQty]);
+    let qty = costingToNumber_(r[idxQty]);
+    if (idxAllocQty != null) {
+      const allocQty = costingToNumber_(r[idxAllocQty]);
+      if (allocQty > 0) qty = allocQty;
+    }
     if (!qty) continue;
     const amountRaw = idxCost != null ? costingToNumber_(r[idxCost]) : costingToNumber_(r[idxPrice]) * qty;
     const currencyRaw = idxCurrency != null ? String(r[idxCurrency] || '').trim().toUpperCase() : 'RUB';
     const currency = currencyRaw || 'RUB';
-    // Единая стратегия курса: для RUB — 1, для остальных валют — курс ЦБ на дату прогона из кэша.
-    // Внутри одного пересчёта все строки одной валюты получают один и тот же курс (ровно один запрос на валюту).
-    let fxRate;
-    if (currency === 'RUB') {
-      fxRate = 1;
-    } else {
-      fxRate = costingResolveFxRate_(fxCache, currency);
-      if (fxRate == null) {
-        // Откладываем ошибку — соберём весь список и кинем единое исключение.
-        fxMissing.push({
-          shipmentId: shipmentId,
-          sku: sku,
-          supplierArticle: idxSupplierArticle != null ? String(r[idxSupplierArticle] || '').trim() : '',
-          currency: currency,
-          amount: amountRaw
-        });
-        // Чтобы дальше не падать в умножениях — временно ставим 0, всё равно throw в конце.
-        fxRate = 0;
-      }
+    const spec = idxSpec != null ? String(r[idxSpec] || '').trim() : '';
+    const batchKey = costingPaymentBatchKey_(shipmentId, sku, spec);
+    const manualRate = idxRate != null ? r[idxRate] : '';
+    const fxCtx = {
+      shipmentId: shipmentId,
+      sku: sku,
+      supplierArticle: idxSupplierArticle != null ? String(r[idxSupplierArticle] || '').trim() : '',
+      spec: spec,
+      currency: currency
+    };
+    const fxResolved = costingResolveFxRateForBatch_(paymentMap, batchKey, manualRate, currency, fxCache, fxMissing, fxCtx);
+    let fxRate = 0;
+    let fxSource = '';
+    if (fxResolved) {
+      fxRate = fxResolved.rate;
+      fxSource = fxResolved.source;
     }
     const purchaseRub = amountRaw * fxRate;
     const tnvedRaw = idxTnved != null ? r[idxTnved] : '';
@@ -640,11 +712,12 @@ function costingBuildSkuCostRowsFromBatchesAndExpenses_(ss, shipmentFilter, opti
       const eurRate = costingResolveFxRate_(fxCache, 'EUR');
       if (eurRate == null) {
         fxMissing.push({
+          reason: 'cbr',
           shipmentId: shipmentId,
           sku: sku,
           supplierArticle: idxSupplierArticle != null ? String(r[idxSupplierArticle] || '').trim() : '',
-          currency: 'EUR (для весовой пошлины)',
-          amount: 0
+          spec: spec,
+          currency: 'EUR (для весовой пошлины)'
         });
         dutyRub = 0;
       } else {
@@ -672,7 +745,9 @@ function costingBuildSkuCostRowsFromBatchesAndExpenses_(ss, shipmentFilter, opti
       qty: qty,
       purchaseRub: purchaseRub,
       dutyRub: dutyRub,
-      vatRate: vatRate
+      vatRate: vatRate,
+      fxRate: fxRate,
+      fxSource: fxSource
     });
 
     if (!baseTotalsByShipment[shipmentId]) {
@@ -695,33 +770,8 @@ function costingBuildSkuCostRowsFromBatchesAndExpenses_(ss, shipmentFilter, opti
     tots.QTY += qty;
   }
 
-  // Если хотя бы для одной валюты не удалось получить курс ЦБ — бросаем единое читаемое исключение.
-  // Курс ЦБ один на всю валюту в прогоне (через fxCache), поэтому при сбое падают сразу все строки
-  // этой валюты — это лучше, чем тихая «мешанина» в колонке «Закупка_руб».
   if (fxMissing.length) {
-    const byCurrency = {};
-    for (let i = 0; i < fxMissing.length; i++) {
-      const k = fxMissing[i].currency;
-      if (!byCurrency[k]) byCurrency[k] = [];
-      byCurrency[k].push(fxMissing[i]);
-    }
-    const lines = ['Не удалось получить курс ЦБ для части валют (cbr.ru недоступен или валюта не найдена).'];
-    const codes = Object.keys(byCurrency).sort();
-    for (let i = 0; i < codes.length; i++) {
-      const code = codes[i];
-      const items = byCurrency[code];
-      const skuList = items.slice(0, 20).map(function (x) {
-        return x.shipmentId + ' / ' + (x.sku || x.supplierArticle || '(пусто)');
-      }).join(', ');
-      const overflow = items.length > 20 ? ' …и ещё ' + (items.length - 20) : '';
-      lines.push('• ' + code + ' — ' + items.length + ' стр.: ' + skuList + overflow);
-    }
-    lines.push('');
-    lines.push('Что делать (любой из вариантов):');
-    lines.push('  1) Перезапустить пересчёт чуть позже (когда cbr.ru снова станет доступен).');
-    lines.push('  2) Если деньги реально в рублях — поставить в «Валюта» значение RUB.');
-    lines.push('  3) Проверить код валюты в «Партии_в_рейсе» (CNY, USD, EUR, …).');
-    throw new Error(lines.join('\n'));
+    throw new Error(costingFormatFxMissingError_(fxMissing));
   }
 
   // Жёсткая валидация: если для рейса (или scoped-поставщика) использован ALLOC_BASE,
@@ -864,7 +914,9 @@ function costingBuildSkuCostRowsFromBatchesAndExpenses_(ss, shipmentFilter, opti
       otherRub,
       extraTotal,
       total,
-      unit
+      unit,
+      x.fxRate,
+      x.fxSource || ''
       ],
       byArticle: articleBreakdown
     });
@@ -875,7 +927,7 @@ function costingBuildSkuCostRowsFromBatchesAndExpenses_(ss, shipmentFilter, opti
   const additionalExpenseColumns = Object.keys(additionalExpenseColumnSet).sort();
   const finalizedRows = rows.map(function (rowObj) {
     const base = rowObj.base.slice(0, 15);
-    const totals = rowObj.base.slice(15);
+    const totals = rowObj.base.slice(15); // итого + unit + FX (5 полей)
     for (let i = 0; i < additionalExpenseColumns.length; i++) {
       const col = additionalExpenseColumns[i];
       base.push(rowObj.byArticle[col] || 0);
@@ -887,8 +939,19 @@ function costingBuildSkuCostRowsFromBatchesAndExpenses_(ss, shipmentFilter, opti
     rows: finalizedRows,
     skuCount: Object.keys(skuSet).length,
     shipmentCount: Object.keys(shipmentSet).length,
-    additionalExpenseColumns: additionalExpenseColumns
+    additionalExpenseColumns: additionalExpenseColumns,
+    skippedFactExpenses: skippedFactExpenses,
+    tripExpenseFxFilled: tripExpenseFxFilled
   };
+}
+
+function costingFormatSkippedFactExpenses_(list, maxLines) {
+  const cap = maxLines == null ? 8 : maxLines;
+  if (!list || !list.length) return '';
+  const lines = list.slice(0, cap);
+  let out = '\n\n⚠️ Не попали в факт (нет суммы RUB):\n• ' + lines.join('\n• ');
+  if (list.length > cap) out += '\n• … ещё ' + (list.length - cap);
+  return out;
 }
 
 function costingLoadDutyRulesByTnved_(ss) {
@@ -1152,16 +1215,26 @@ function costingMergePlanDutyVatIntoFactRows_(factRows, planRows) {
   });
 }
 
-function costingBuildSkuCostRowsFact_(shipmentFilter) {
+function costingBuildSkuCostRowsFact_(shipmentFilter, options) {
+  options = options || {};
   const ss = SpreadsheetApp.getActiveSpreadsheet();
-  const planReport = costingBuildSkuCostRowsFromBatchesAndExpenses_(ss, shipmentFilter, { scenarioMode: 'PLAN' });
-  const factReport = costingBuildSkuCostRowsFromBatchesAndExpenses_(ss, shipmentFilter, { scenarioMode: 'FACT' });
+  const buildOpts = {
+    writeTripExpenseFx: options.writeTripExpenseFx !== false
+  };
+  const planReport = costingBuildSkuCostRowsFromBatchesAndExpenses_(ss, shipmentFilter, Object.assign({
+    scenarioMode: 'PLAN'
+  }, buildOpts));
+  const factReport = costingBuildSkuCostRowsFromBatchesAndExpenses_(ss, shipmentFilter, Object.assign({
+    scenarioMode: 'FACT'
+  }, buildOpts));
   const rows = costingMergePlanDutyVatIntoFactRows_(factReport.rows, planReport.rows);
   return {
     rows: rows,
     skuCount: factReport.skuCount,
     shipmentCount: factReport.shipmentCount,
     additionalExpenseColumns: factReport.additionalExpenseColumns,
+    skippedFactExpenses: factReport.skippedFactExpenses || [],
+    tripExpenseFxFilled: factReport.tripExpenseFxFilled || 0,
     planReport: planReport
   };
 }
@@ -1178,11 +1251,12 @@ function costingDryRunFactPrompt_() {
   try {
     costingHealthCheckCore_();
     costingEnsureCustomsFactColumns_(SpreadsheetApp.getActiveSpreadsheet());
-    const report = costingBuildSkuCostRowsFact_(shipmentId || null);
+    const report = costingBuildSkuCostRowsFact_(shipmentId || null, { writeTripExpenseFx: false });
     const compare = costingBuildPlanFactCompareFromReport_(report, shipmentId || null);
     ui.alert(
       '🧪 Dry-run факт',
-      'Строк: ' + report.rows.length + '\nSKU: ' + report.skuCount + '\n\n' + compare,
+      'Строк: ' + report.rows.length + '\nSKU: ' + report.skuCount + '\n\n' + compare +
+      costingFormatSkippedFactExpenses_(report.skippedFactExpenses),
       ui.ButtonSet.OK
     );
   } catch (e) {
@@ -1216,11 +1290,15 @@ function rebuildCostingFact_() {
     sh.clearContents();
     sh.getRange(1, 1, 1, header[0].length).setValues(header);
     if (report.rows.length) {
-      sh.getRange(2, 1, report.rows.length + 1, header[0].length).setValues(report.rows);
+      sh.getRange(2, 1, report.rows.length, header[0].length).setValues(report.rows);
     }
+    const fxMsg = report.tripExpenseFxFilled
+      ? ('\nПодставлено курсов в «Затраты рейса» (FACT): ' + report.tripExpenseFxFilled)
+      : '';
     ui.alert(
       '✅ Фактический пересчёт завершён',
-      'Записано строк: ' + report.rows.length + '\nSKU: ' + report.skuCount,
+      'Записано строк: ' + report.rows.length + '\nSKU: ' + report.skuCount + fxMsg +
+      costingFormatSkippedFactExpenses_(report.skippedFactExpenses),
       ui.ButtonSet.OK
     );
   } catch (e) {
@@ -1242,7 +1320,8 @@ function rebuildCostingFactByShipment_(shipmentId) {
   costingUpsertShipmentRowsToCostSku_(sh, id, report.rows, targetHeader);
   SpreadsheetApp.getUi().alert(
     '✅ Факт по рейсу',
-    'SHIPMENT_ID: ' + id + '\nОбновлено строк: ' + report.rows.length,
+    'SHIPMENT_ID: ' + id + '\nОбновлено строк: ' + report.rows.length +
+    costingFormatSkippedFactExpenses_(report.skippedFactExpenses),
     SpreadsheetApp.getUi().ButtonSet.OK
   );
 }
@@ -1251,13 +1330,277 @@ function costingComparePlanFactPrompt_() {
   const ui = SpreadsheetApp.getUi();
   const res = ui.prompt(
     'Сверка план vs факт',
-    'Введите SHIPMENT_ID (пусто = все):',
+    'Введите SHIPMENT_ID (пусто = все рейсы на листе):',
     ui.ButtonSet.OK_CANCEL
   );
   if (res.getSelectedButton() !== ui.Button.OK) return;
   const shipmentId = String(res.getResponseText() || '').trim();
-  const text = costingBuildPlanFactCompareReport_(shipmentId || null);
-  ui.alert('Сверка план vs факт', text, ui.ButtonSet.OK);
+  try {
+    const result = costingRebuildPlanFactCompareSheet_(shipmentId || null);
+    const ss = SpreadsheetApp.getActiveSpreadsheet();
+    const sh = costingGetSheetByRole_(ss, 'PLAN_FACT_COMPARE');
+    ss.setActiveSheet(sh);
+    ui.alert(
+      '✅ Сверка обновлена',
+      'Лист: «' + COST_CFG.SHEETS.PLAN_FACT_COMPARE + '»\n' +
+      'Строк: ' + result.rowCount + '\n' +
+      'С расхождением: ' + result.diffCount + '\n' +
+      'Только в плане: ' + result.onlyPlan + '\n' +
+      'Только в факте: ' + result.onlyFact + '\n\n' +
+      result.summaryText,
+      ui.ButtonSet.OK
+    );
+  } catch (e) {
+    ui.alert('❌ Сверка план vs факт', e.message || String(e), ui.ButtonSet.OK);
+    throw e;
+  }
+}
+
+/** Итоги себестоимости — сразу после Qty на листе сверки. */
+function costingPlanFactCompareCostMetricNames_() {
+  return ['Итого_партия_руб', 'Себестоимость_ед_руб'];
+}
+
+/** Детализация расходов — после блока себестоимости. */
+function costingPlanFactCompareOtherMetricNames_() {
+  return [
+    'Закупка_руб',
+    'Таможенная_стоимость_база_RUB',
+    'Расходы_до_границы_RUB',
+    'Фрахт_до_РФ_RUB',
+    'Прочая_логистика_RUB',
+    'Пошлина_RUB',
+    'НДС_RUB',
+    'Таможенный_сбор_RUB',
+    'Прочие_расходы_RUB',
+    'Итого_доп_расходы_RUB'
+  ];
+}
+
+function costingPlanFactCompareMetricNames_() {
+  return costingPlanFactCompareCostMetricNames_().concat(costingPlanFactCompareOtherMetricNames_());
+}
+
+function costingPlanFactCompareSkipHeaderNorms_() {
+  return [
+    'расчет время',
+    'shipment id',
+    'артикул вб',
+    'артикул поставщика',
+    'код тнвэд',
+    'qty',
+    'курс средневзв rub',
+    'fx источник',
+    'пошлина план rub',
+    'ндс план rub',
+    'сценарий',
+    'обновлено время',
+    'только план',
+    'только факт',
+    'есть расхождение'
+  ];
+}
+
+function costingCollectCompareMetrics_(planHeader, factHeader) {
+  const metrics = costingPlanFactCompareCostMetricNames_()
+    .concat(costingPlanFactCompareOtherMetricNames_());
+  const seen = {};
+  metrics.forEach(function (m) {
+    seen[costingHeaderCanonForLookup_(m)] = true;
+  });
+  const skip = costingPlanFactCompareSkipHeaderNorms_();
+  const factByNorm = {};
+  const extras = [];
+  for (let i = 0; i < factHeader.length; i++) {
+    const name = String(factHeader[i] || '').trim();
+    if (!name) continue;
+    factByNorm[costingHeaderCanonForLookup_(name)] = name;
+  }
+  for (let i = 0; i < planHeader.length; i++) {
+    const name = String(planHeader[i] || '').trim();
+    if (!name) continue;
+    const norm = costingHeaderCanonForLookup_(name);
+    if (skip.indexOf(norm) !== -1 || seen[norm]) continue;
+    if (!factByNorm[norm]) continue;
+    extras.push(name);
+    seen[norm] = true;
+  }
+  return metrics.concat(extras);
+}
+
+function costingBuildPlanFactCompareHeader_(metrics) {
+  const header = [
+    'Обновлено_время',
+    'SHIPMENT_ID',
+    'Артикул_ВБ',
+    'Артикул_поставщика',
+    'Код_ТНВЭД',
+    'Qty'
+  ];
+  for (let i = 0; i < metrics.length; i++) {
+    const m = metrics[i];
+    header.push(m + '_план', m + '_факт', m + '_Δ');
+  }
+  header.push('Только_план', 'Только_факт', 'Есть_расхождение', 'Σ|Δ|_RUB');
+  return header;
+}
+
+function costingEnsurePlanFactCompareSheet_(ss) {
+  let sh = costingFindSheetByRole_(ss, 'PLAN_FACT_COMPARE');
+  if (!sh) sh = ss.insertSheet(COST_CFG.SHEETS.PLAN_FACT_COMPARE);
+  if (sh.getLastRow() < 1) {
+    const header = costingBuildPlanFactCompareHeader_(costingPlanFactCompareMetricNames_());
+    sh.getRange(1, 1, 1, header.length).setValues([header]);
+    sh.getRange(1, 1, 1, header.length).setFontWeight('bold');
+    sh.setFrozenRows(1);
+  }
+  return sh;
+}
+
+/**
+ * Читает лист себестоимости (план или факт) в карту по ключу SHIPMENT_ID + Артикул_ВБ.
+ */
+function costingLoadCostSkuSheetMap_(sh) {
+  const out = { header: [], byKey: {} };
+  if (!sh || sh.getLastRow() < 2) return out;
+  const data = sh.getDataRange().getValues();
+  out.header = data[0];
+  const h = out.header;
+  const idxShip = costingFindCol_(h, ['SHIPMENT_ID', 'Shipment_ID', 'Рейс']);
+  const idxSku = costingFindCol_(h, ['Артикул_ВБ', 'Артикул ВБ', 'WB_ARTICLE']);
+  const idxSupplier = costingFindColOptional_(h, ['Артикул_поставщика', 'Артикул поставщика']);
+  const idxTnved = costingFindColOptional_(h, ['Код_ТНВЭД', 'Код ТН ВЭД', 'ТНВЭД']);
+  const idxQty = costingFindColOptional_(h, ['Qty', 'QTY', 'Количество']);
+  const metricIdx = {};
+  for (let c = 0; c < h.length; c++) {
+    const name = String(h[c] || '').trim();
+    if (!name) continue;
+    const norm = costingHeaderCanonForLookup_(name);
+    if (costingPlanFactCompareSkipHeaderNorms_().indexOf(norm) !== -1) continue;
+    metricIdx[norm] = c;
+  }
+  for (let r = 1; r < data.length; r++) {
+    const row = data[r];
+    const shipmentId = String(row[idxShip] || '').trim();
+    const sku = String(row[idxSku] || '').trim();
+    if (!shipmentId || !sku) continue;
+    const key = costingPlanFactRowKey_(shipmentId, sku);
+    const values = {};
+    Object.keys(metricIdx).forEach(function (norm) {
+      values[norm] = costingToNumber_(row[metricIdx[norm]]);
+    });
+    out.byKey[key] = {
+      shipmentId: shipmentId,
+      sku: sku,
+      supplierArticle: idxSupplier != null ? String(row[idxSupplier] || '').trim() : '',
+      tnved: idxTnved != null ? String(row[idxTnved] || '').trim() : '',
+      qty: idxQty != null ? costingToNumber_(row[idxQty]) : 0,
+      values: values
+    };
+  }
+  return out;
+}
+
+function costingPlanFactRowKey_(shipmentId, wbArticle) {
+  return String(shipmentId || '').trim() + '\t' + String(wbArticle || '').trim();
+}
+
+function costingMetricNorm_(metricName) {
+  return costingHeaderCanonForLookup_(metricName);
+}
+
+function costingReadMetricValue_(entry, metricName) {
+  if (!entry || !entry.values) return 0;
+  const v = entry.values[costingMetricNorm_(metricName)];
+  return v == null ? 0 : costingToNumber_(v);
+}
+
+function costingRebuildPlanFactCompareSheet_(shipmentFilter) {
+  const ss = SpreadsheetApp.getActiveSpreadsheet();
+  const planSh = costingFindSheetByRole_(ss, 'COST_SKU');
+  const factSh = costingFindSheetByRole_(ss, 'COST_SKU_FACT');
+  if (!planSh || planSh.getLastRow() < 2) {
+    throw new Error('Лист «Себестоимость SKU» (план) пуст. Сначала выполните плановый пересчёт.');
+  }
+  if (!factSh || factSh.getLastRow() < 2) {
+    throw new Error('Лист «Факт_себестоимость SKU» пуст. Сначала выполните фактический пересчёт.');
+  }
+  const planMap = costingLoadCostSkuSheetMap_(planSh);
+  const factMap = costingLoadCostSkuSheetMap_(factSh);
+  const metrics = costingCollectCompareMetrics_(planMap.header, factMap.header);
+  const header = costingBuildPlanFactCompareHeader_(metrics);
+  const keys = {};
+  Object.keys(planMap.byKey).forEach(function (k) { keys[k] = true; });
+  Object.keys(factMap.byKey).forEach(function (k) { keys[k] = true; });
+  const sortedKeys = Object.keys(keys).sort();
+  const updatedAt = new Date();
+  const rows = [];
+  let diffCount = 0;
+  let onlyPlan = 0;
+  let onlyFact = 0;
+  let dutyDiffSum = 0;
+  let vatDiffSum = 0;
+  const EPS = 0.01;
+
+  for (let i = 0; i < sortedKeys.length; i++) {
+    const key = sortedKeys[i];
+    const p = planMap.byKey[key];
+    const f = factMap.byKey[key];
+    const shipmentId = (p && p.shipmentId) || (f && f.shipmentId) || '';
+    if (shipmentFilter && shipmentId !== shipmentFilter) continue;
+    const inPlan = !!p;
+    const inFact = !!f;
+    if (inPlan && !inFact) onlyPlan++;
+    if (!inPlan && inFact) onlyFact++;
+    const meta = p || f;
+    let absSum = 0;
+    let hasDiff = false;
+    const row = [
+      updatedAt,
+      shipmentId,
+      meta.sku,
+      meta.supplierArticle,
+      meta.tnved,
+      meta.qty
+    ];
+    for (let m = 0; m < metrics.length; m++) {
+      const metric = metrics[m];
+      const planVal = costingReadMetricValue_(p, metric);
+      const factVal = costingReadMetricValue_(f, metric);
+      const delta = factVal - planVal;
+      row.push(planVal, factVal, delta);
+      absSum += Math.abs(delta);
+      if (Math.abs(delta) >= EPS) hasDiff = true;
+      if (costingMetricNorm_(metric) === costingMetricNorm_('Пошлина_RUB')) dutyDiffSum += delta;
+      if (costingMetricNorm_(metric) === costingMetricNorm_('НДС_RUB')) vatDiffSum += delta;
+    }
+    if (hasDiff) diffCount++;
+    row.push(
+      inPlan && !inFact ? 'ДА' : '',
+      !inPlan && inFact ? 'ДА' : '',
+      hasDiff ? 'ДА' : '',
+      Math.round(absSum * 100) / 100
+    );
+    rows.push(row);
+  }
+
+  const sh = costingEnsurePlanFactCompareSheet_(ss);
+  sh.clearContents();
+  sh.getRange(1, 1, 1, header.length).setValues([header]);
+  sh.getRange(1, 1, 1, header.length).setFontWeight('bold');
+  sh.setFrozenRows(1);
+  if (rows.length) {
+    sh.getRange(2, 1, rows.length, header.length).setValues(rows);
+  }
+  const summaryText =
+    'Σ Δпошлина: ' + dutyDiffSum.toFixed(2) + '\nΣ ΔНДС: ' + vatDiffSum.toFixed(2);
+  return {
+    rowCount: rows.length,
+    diffCount: diffCount,
+    onlyPlan: onlyPlan,
+    onlyFact: onlyFact,
+    summaryText: summaryText
+  };
 }
 
 function costingBuildPlanFactCompareFromReport_(report, shipmentFilter) {
@@ -1381,8 +1724,345 @@ function costingIsPostBorder_(scope) {
   );
 }
 
+/* ===================== FX: транши оплат (Сводная 01) + ЦБ по дате ===================== */
+
+/** Ключ сопоставления партии ↔ строка «Сводной» с оплатами. */
+function costingPaymentBatchKey_(shipmentId, wbArticle, specNumber) {
+  return [
+    String(shipmentId || '').trim(),
+    String(wbArticle || '').trim(),
+    costingNormalizeSpecForPaymentKey_(specNumber)
+  ].join('\t');
+}
+
+/** Нормализация № спецификации — как в payments_sync.gs. */
+function costingNormalizeSpecForPaymentKey_(val) {
+  if (val == null || val === '') return '';
+  if (Object.prototype.toString.call(val) === '[object Date]' && !isNaN(val.getTime())) {
+    const d = val.getDate();
+    const m = val.getMonth() + 1;
+    return d + '/' + m;
+  }
+  let s = String(val).toLowerCase().trim().replace(/\s+/g, '').replace(/\.0$/, '');
+  let m = s.match(/^(\d{4})-(\d{2})-(\d{2})(?:t.*)?$/);
+  if (m) return parseInt(m[3], 10) + '/' + parseInt(m[2], 10);
+  m = s.match(/^(\d{2})\.(\d{2})\.(\d{4})$/);
+  if (m) return parseInt(m[1], 10) + '/' + parseInt(m[2], 10);
+  m = s.match(/^(\d{1,2})\/0(\d)$/);
+  if (m) return parseInt(m[1], 10) + '/' + parseInt(m[2], 10);
+  return s;
+}
+
+/** Является ли значение датой фактической оплаты (не URL). */
+function costingPaymentFactDatePresent_(rawVal, displayVal) {
+  if (rawVal === true) return true;
+  if (rawVal === false) return false;
+  if (rawVal instanceof Date && !isNaN(rawVal.getTime())) return true;
+  const rawText = rawVal == null ? '' : String(rawVal).trim();
+  const dispText = displayVal == null ? '' : String(displayVal).trim();
+  if (/^https?:\/\//i.test(rawText) || /^https?:\/\//i.test(dispText)) return false;
+  if (/^\d{1,2}[./-]\d{1,2}([./-]\d{2,4})?$/.test(rawText)) return true;
+  if (/^\d{1,2}[./-]\d{1,2}([./-]\d{2,4})?$/.test(dispText)) return true;
+  return false;
+}
+
+function costingParsePaymentAmount_(rawVal, displayVal) {
+  const rawText = rawVal == null ? '' : String(rawVal).trim();
+  const disp = displayVal == null ? '' : String(displayVal).trim();
+  if (/^https?:\/\//i.test(rawText) || /^https?:\/\//i.test(disp)) return 0;
+  if (typeof rawVal === 'number' && isFinite(rawVal)) return rawVal;
+  if (/^-?\d+(?:[.,]\d+)?$/.test(rawText)) return parseFloat(rawText.replace(',', '.'));
+  const cleaned = disp
+    .replace(/\u00A0/g, ' ')
+    .replace(/\s+/g, '')
+    .replace(/,/g, '.')
+    .replace(/[^\d.-]/g, '');
+  if (/^-?\d+(?:\.\d+)?$/.test(cleaned)) return parseFloat(cleaned);
+  return 0;
+}
+
+function costingParsePaymentDate_(rawVal, displayVal) {
+  if (rawVal instanceof Date && !isNaN(rawVal.getTime())) return rawVal;
+  if (typeof rawVal === 'number' && isFinite(rawVal) && rawVal > 0) {
+    const dSerial = new Date(Math.round((rawVal - 25569) * 86400 * 1000));
+    if (!isNaN(dSerial.getTime())) return dSerial;
+  }
+  const rawText = rawVal == null ? '' : String(rawVal).trim();
+  const dispText = displayVal == null ? '' : String(displayVal).trim();
+  const tryText = dispText || rawText;
+  if (!tryText) return null;
+  if (/^https?:\/\//i.test(tryText)) return null;
+  const mRu = tryText.match(/^(\d{1,2})[./](\d{1,2})[./](\d{2,4})$/);
+  if (mRu) {
+    let y = parseInt(mRu[3], 10);
+    if (y < 100) y += 2000;
+    const d = new Date(y, parseInt(mRu[2], 10) - 1, parseInt(mRu[1], 10));
+    return isNaN(d.getTime()) ? null : d;
+  }
+  const d2 = new Date(tryText);
+  return isNaN(d2.getTime()) ? null : d2;
+}
+
+function costingPickPaymentDate_(factRaw, factDisp, planRaw, planDisp, preferFact) {
+  if (preferFact && costingPaymentFactDatePresent_(factRaw, factDisp)) {
+    return costingParsePaymentDate_(factRaw, factDisp);
+  }
+  const plan = costingParsePaymentDate_(planRaw, planDisp);
+  if (plan) return plan;
+  if (!preferFact && costingPaymentFactDatePresent_(factRaw, factDisp)) {
+    return costingParsePaymentDate_(factRaw, factDisp);
+  }
+  return null;
+}
+
+/**
+ * Транши из строки «Сводной»: аванс, остаток, отсрочка (дата операции для defer).
+ * @returns {Array<{type:string, amount:number, date:Date}>}
+ */
+function costingBuildPaymentTranchesFromSummaryRow_(row, displayRow, cols) {
+  const tranches = [];
+  const add = function (type, sumCol, factCol, planCol, opCol) {
+    if (sumCol == null) return;
+    const amount = costingParsePaymentAmount_(row[sumCol], displayRow[sumCol]);
+    if (!(amount > 0)) return;
+    let date = null;
+    if (opCol != null) {
+      date = costingParsePaymentDate_(row[opCol], displayRow[opCol]);
+    }
+    if (!date) {
+      date = costingPickPaymentDate_(
+        factCol != null ? row[factCol] : '',
+        factCol != null ? displayRow[factCol] : '',
+        planCol != null ? row[planCol] : '',
+        planCol != null ? displayRow[planCol] : '',
+        true
+      );
+    }
+    if (!date) {
+      date = costingPickPaymentDate_(
+        factCol != null ? row[factCol] : '',
+        factCol != null ? displayRow[factCol] : '',
+        planCol != null ? row[planCol] : '',
+        planCol != null ? displayRow[planCol] : '',
+        false
+      );
+    }
+    if (!date) return;
+    tranches.push({ type: type, amount: amount, date: date });
+  };
+  add('advance', cols.advSum, cols.advFact, cols.advPlan, null);
+  add('balance', cols.balSum, cols.balFact, cols.balPlan, null);
+  add('defer', cols.defSum, cols.defFact, cols.defPlan, cols.defOpDate);
+  return tranches;
+}
+
+/**
+ * Карта траншей оплат из «Сводной» (книга 01). Первая строка по ключу; дубликаты — в warnings.
+ * @returns {{ map: Object, duplicateWarnings: string[] }}
+ */
+function costingLoadPaymentTranchesFromSummary_(summarySh, shipmentFilter) {
+  const out = { map: {}, duplicateWarnings: [] };
+  const lr = summarySh.getLastRow();
+  const lc = summarySh.getLastColumn();
+  if (lr < 3 || lc < 1) return out;
+
+  const headerRow = summarySh.getRange(2, 1, 1, lc).getValues()[0] || [];
+  const idxShipment = costingFindColOptional_(headerRow, ['Рейс', 'SHIPMENT_ID', 'Shipment_ID', 'ID_рейса']);
+  const idxWb = costingFindCol_(headerRow, ['Артикул ВБ', 'Артикул_ВБ', 'WB_ARTICLE']);
+  const idxSpec = costingFindColOptional_(headerRow, [
+    'Номер спецификации', 'Номер_спецификации', 'Спецификация', '№ спецификации', '№спецификации',
+    'Spec', 'Spec number', 'Номер инвойса', 'Инвойс'
+  ]);
+  const cols = {
+    advSum: costingFindColOptional_(headerRow, ['Аванс сумма', 'Аванс, сумма']),
+    advPlan: costingFindColOptional_(headerRow, ['Аванс план', 'Аванс план дата', 'Дата план Аванс']),
+    advFact: costingFindColOptional_(headerRow, ['Аванс факт', 'Аванс факт дата', 'Дата факт Аванс']),
+    balSum: costingFindColOptional_(headerRow, ['Баланс сумма', 'Баланс, сумма', 'Остаток сумма', 'Остаток, сумма']),
+    balPlan: costingFindColOptional_(headerRow, ['Баланс план', 'Баланс план дата', 'Дата план Баланс', 'Остаток план']),
+    balFact: costingFindColOptional_(headerRow, ['Баланс факт', 'Баланс факт дата', 'Дата факт Баланс', 'Остаток факт']),
+    defSum: costingFindColOptional_(headerRow, ['Отсрочка сумма', 'Отсрочка, сумма']),
+    defPlan: costingFindColOptional_(headerRow, ['Отсрочка план', 'Отсрочка план дата', 'Дата План Отсрочка']),
+    defFact: costingFindColOptional_(headerRow, ['Отсрочка факт', 'Отсрочка факт дата', 'Дата Факт Отсрочка']),
+    defOpDate: costingFindColOptional_(headerRow, [
+      'Дата операции', 'Дата операции отсрочки', 'Дата опер. отсрочки', 'Дата опер отсрочки'
+    ])
+  };
+  if (idxShipment == null) return out;
+
+  const data = summarySh.getRange(3, 1, lr - 2, lc).getValues();
+  const dataDisplay = summarySh.getRange(3, 1, lr - 2, lc).getDisplayValues();
+
+  for (let i = 0; i < data.length; i++) {
+    const r = data[i];
+    const d = dataDisplay[i];
+    if (String(r[0] || '').trim().indexOf('▸') === 0) continue;
+    const shipmentId = String(r[idxShipment] || '').trim();
+    const wb = String(r[idxWb] || '').trim();
+    if (!shipmentId || !wb) continue;
+    if (shipmentFilter && shipmentId !== shipmentFilter) continue;
+    const spec = idxSpec != null ? (String(r[idxSpec] || '').trim() || String(d[idxSpec] || '').trim()) : '';
+    const tranches = costingBuildPaymentTranchesFromSummaryRow_(r, d, cols);
+    if (!tranches.length) continue;
+    const key = costingPaymentBatchKey_(shipmentId, wb, spec);
+    if (out.map[key]) {
+      if (out.duplicateWarnings.length < 20) {
+        out.duplicateWarnings.push(shipmentId + ' / ' + wb + ' / спец ' + (spec || '(пусто)'));
+      }
+      continue;
+    }
+    out.map[key] = tranches;
+  }
+  return out;
+}
+
+/** Безопасная загрузка траншей из книги 01; при недоступности 01 — пустая map (только ручной курс в партии). */
+function costingLoadPaymentTranchesMapSafe_(shipmentFilter) {
+  try {
+    const ss01 = costingOpenBook01_();
+    const summarySh = ss01.getSheetByName('Сводная');
+    if (!summarySh) return { map: {}, duplicateWarnings: [] };
+    return costingLoadPaymentTranchesFromSummary_(summarySh, shipmentFilter);
+  } catch (e) {
+    return { map: {}, duplicateWarnings: [], book01Error: e.message || String(e) };
+  }
+}
+
+function costingFxDateCacheKey_(currencyCode, dateObj) {
+  const d = dateObj instanceof Date && !isNaN(dateObj.getTime()) ? dateObj : new Date();
+  const yyyy = d.getFullYear();
+  const mm = ('0' + (d.getMonth() + 1)).slice(-2);
+  const dd = ('0' + d.getDate()).slice(-2);
+  return String(currencyCode || '').trim().toUpperCase() + '|' + yyyy + '-' + mm + '-' + dd;
+}
+
+/**
+ * Средневзвешенный курс ЦБ по траншам.
+ * @returns {{ rate: number, weightSum: number, trancheCount: number }|null}
+ */
+function costingComputeWeightedFxRate_(tranches, currencyCode, cache, missingOut) {
+  if (!tranches || !tranches.length) return null;
+  let weightSum = 0;
+  let rubSum = 0;
+  let used = 0;
+  for (let i = 0; i < tranches.length; i++) {
+    const t = tranches[i];
+    const amount = costingToNumber_(t.amount);
+    if (!(amount > 0) || !t.date) continue;
+    const rate = costingResolveFxRateOnDate_(cache, currencyCode, t.date);
+    if (rate == null) {
+      if (missingOut) {
+        missingOut.push({
+          reason: 'cbr',
+          currency: String(currencyCode || '').trim().toUpperCase(),
+          date: t.date,
+          tranche: t.type || ''
+        });
+      }
+      return null;
+    }
+    weightSum += amount;
+    rubSum += amount * rate;
+    used++;
+  }
+  if (!(weightSum > 0) || !(used > 0)) return null;
+  return { rate: rubSum / weightSum, weightSum: weightSum, trancheCount: used };
+}
+
+/**
+ * Курс для строки партии: weighted → ручной Курс_к_RUB → ошибка.
+ * @returns {{ rate: number, source: string }|null}
+ */
+function costingResolveFxRateForBatch_(paymentMap, batchKey, manualRateRaw, currencyCode, cache, missingOut, ctx) {
+  const currency = String(currencyCode || '').trim().toUpperCase();
+  if (!currency || currency === 'RUB') return { rate: 1, source: 'RUB' };
+
+  const tranches = paymentMap && paymentMap[batchKey];
+  const weightedMissing = [];
+  const weighted = tranches ? costingComputeWeightedFxRate_(tranches, currency, cache, weightedMissing) : null;
+  if (weighted && weighted.rate > 0) {
+    return { rate: weighted.rate, source: 'weighted:' + weighted.trancheCount };
+  }
+
+  const manual = costingToNumber_(manualRateRaw);
+  if (manual > 0) return { rate: manual, source: 'manual_batch' };
+
+  if (weightedMissing.length && missingOut) {
+    for (let i = 0; i < weightedMissing.length; i++) {
+      missingOut.push(Object.assign({ reason: 'cbr' }, weightedMissing[i], ctx || {}));
+    }
+    return null;
+  }
+
+  if (missingOut) {
+    missingOut.push(Object.assign({ reason: 'no_fx' }, ctx || {}));
+  }
+  return null;
+}
+
+function costingFormatFxMissingError_(fxMissing) {
+  const cbrItems = [];
+  const noFxItems = [];
+  for (let i = 0; i < fxMissing.length; i++) {
+    const reason = fxMissing[i].reason;
+    if (reason === 'cbr') cbrItems.push(fxMissing[i]);
+    else if (reason !== 'expense_no_date') noFxItems.push(fxMissing[i]);
+  }
+  const lines = [];
+
+  if (cbrItems.length) {
+    const byKey = {};
+    for (let i = 0; i < cbrItems.length; i++) {
+      const x = cbrItems[i];
+      const dk = (x.currency || '?') + '|' + (x.date ? costingFxDateCacheKey_(x.currency, x.date).split('|')[1] : '?');
+      if (!byKey[dk]) byKey[dk] = [];
+      byKey[dk].push(x);
+    }
+    lines.push('Не удалось получить курс ЦБ на дату платежа (cbr.ru недоступен или валюта не найдена).');
+    const keys = Object.keys(byKey).sort();
+    for (let ki = 0; ki < keys.length; ki++) {
+      const items = byKey[keys[ki]];
+      const skuList = items.slice(0, 15).map(function (x) {
+        return (x.shipmentId || '') + ' / ' + (x.sku || x.supplierArticle || '(пусто)');
+      }).join(', ');
+      const overflow = items.length > 15 ? ' …и ещё ' + (items.length - 15) : '';
+      lines.push('• ' + keys[ki] + ' — ' + items.length + ' стр.: ' + skuList + overflow);
+    }
+  }
+
+  const expenseNoDate = [];
+  for (let i = 0; i < fxMissing.length; i++) {
+    if (fxMissing[i].reason === 'expense_no_date') expenseNoDate.push(fxMissing[i]);
+  }
+  if (expenseNoDate.length) {
+    if (lines.length) lines.push('');
+    lines.push('Затраты рейса в валюте без даты (нужна «Дата оплаты» или «Дата расхода»):');
+    const samples = expenseNoDate.slice(0, 10).map(function (x) {
+      return (x.shipmentId || '') + ' / ' + (x.supplierArticle || x.sku || '');
+    }).join(', ');
+    lines.push('• ' + expenseNoDate.length + ' стр.: ' + samples);
+  }
+
+  if (noFxItems.length) {
+    if (lines.length) lines.push('');
+    lines.push('Нет траншей оплаты в «Сводной» и не заполнен «Курс_к_RUB» в «Партии_в_рейсе» (старые отгрузки).');
+    const skuList = noFxItems.slice(0, 25).map(function (x) {
+      const spec = x.spec ? (' / спец ' + x.spec) : '';
+      return (x.shipmentId || '') + ' / ' + (x.sku || x.supplierArticle || '(пусто)') + spec;
+    }).join(', ');
+    const overflow = noFxItems.length > 25 ? ' …и ещё ' + (noFxItems.length - 25) : '';
+    lines.push('• ' + noFxItems.length + ' стр.: ' + skuList + overflow);
+  }
+
+  lines.push('');
+  lines.push('Что делать:');
+  lines.push('  1) Проверить аванс/остаток/отсрочку в «Сводной» (книга 01) для этих позиций.');
+  lines.push('  2) Для legacy-отгрузок — вписать «Курс_к_RUB» в «Партии_в_рейсе» вручную.');
+  lines.push('  3) Если закупка в рублях — «Валюта» = RUB.');
+  return lines.join('\n');
+}
+
 function costingGetEuroRateOnDate_(dateObj) {
-  return costingGetFxRateOnDate_('EUR', dateObj);
+  return costingGetFxRateOnDateWithFallback_('EUR', dateObj);
 }
 
 /**
@@ -1397,7 +2077,8 @@ function costingGetFxRateOnDate_(currencyCode, dateObj) {
     const target = String(currencyCode || '').trim().toUpperCase();
     if (!target) return null;
     if (target === 'RUB') return 1;
-    const d = dateObj instanceof Date ? dateObj : new Date();
+    const d = dateObj instanceof Date ? dateObj : new Date(dateObj);
+    if (isNaN(d.getTime())) return null;
     const dd = ('0' + d.getDate()).slice(-2);
     const mm = ('0' + (d.getMonth() + 1)).slice(-2);
     const yyyy = d.getFullYear();
@@ -1406,6 +2087,7 @@ function costingGetFxRateOnDate_(currencyCode, dateObj) {
     const doc = XmlService.parse(xml);
     const root = doc.getRootElement();
     const vals = root.getChildren('Valute');
+    if (!vals || !vals.length) return null;
     for (let i = 0; i < vals.length; i++) {
       const codeEl = vals[i].getChild('CharCode');
       if (!codeEl) continue;
@@ -1422,6 +2104,134 @@ function costingGetFxRateOnDate_(currencyCode, dateObj) {
   return null;
 }
 
+/** Курс ЦБ на дату расхода; при отсутствии публикации (выходной) — до maxDaysBack дней назад. */
+function costingGetFxRateOnDateWithFallback_(currencyCode, dateObj, maxDaysBack) {
+  const cap = maxDaysBack == null ? 14 : maxDaysBack;
+  const base = dateObj instanceof Date ? new Date(dateObj.getTime()) : new Date(dateObj);
+  if (isNaN(base.getTime())) return null;
+  for (let i = 0; i <= cap; i++) {
+    const d = new Date(base.getTime());
+    d.setDate(d.getDate() - i);
+    const rate = costingGetFxRateOnDate_(currencyCode, d);
+    if (rate != null && rate > 0) return rate;
+  }
+  return null;
+}
+
+/** Дата для FX по строке «Затраты рейса»: дата расхода → дата оплаты → fallbackDate (обычно сегодня). */
+function costingTripExpenseFxDateFromRow_(row, cols, fallbackDate) {
+  let d = null;
+  if (cols.expenseDate != null) {
+    d = costingParsePaymentDate_(row[cols.expenseDate], row[cols.expenseDate]);
+  }
+  if (!d && cols.payDate != null) {
+    d = costingParsePaymentDate_(row[cols.payDate], row[cols.payDate]);
+  }
+  if (!d && fallbackDate instanceof Date && !isNaN(fallbackDate.getTime())) {
+    d = fallbackDate;
+  }
+  return d;
+}
+
+function costingTripExpenseCellBlank_(v) {
+  if (v == null || v === '') return true;
+  if (typeof v === 'number') return !isFinite(v) || v === 0;
+  return String(v).trim() === '';
+}
+
+/**
+ * Сумма и курс для строки «Затраты рейса» + флаги, что записать в пустые ячейки листа.
+ */
+function costingResolveTripExpenseRubDetail_(row, cols, fxCache, missingOut, ctx) {
+  const out = { sumRub: 0, rate: null, fillRate: false, fillSumRub: false };
+  const amount = cols.sum != null ? costingToNumber_(row[cols.sum]) : 0;
+  if (!(amount > 0)) return out;
+
+  const currencyRaw = cols.currency != null ? String(row[cols.currency] || '').trim().toUpperCase() : '';
+  const currency = currencyRaw || 'RUB';
+  const existingSumRub = cols.sumRub != null ? costingToNumber_(row[cols.sumRub]) : 0;
+  const rateBlank = cols.rate == null || costingTripExpenseCellBlank_(row[cols.rate]);
+  const sumRubBlank = cols.sumRub == null || costingTripExpenseCellBlank_(row[cols.sumRub]);
+
+  if (currency === 'RUB') {
+    out.rate = 1;
+    out.sumRub = sumRubBlank ? amount : existingSumRub;
+    out.fillRate = rateBlank && cols.rate != null;
+    out.fillSumRub = sumRubBlank && cols.sumRub != null;
+    return out;
+  }
+
+  const manualRate = cols.rate != null ? costingToNumber_(row[cols.rate]) : 0;
+  if (!rateBlank && manualRate > 0) {
+    out.rate = manualRate;
+    out.sumRub = sumRubBlank ? Math.round(amount * manualRate * 100) / 100 : existingSumRub;
+    out.fillSumRub = sumRubBlank && cols.sumRub != null;
+    return out;
+  }
+
+  if (!sumRubBlank && existingSumRub > 0 && rateBlank && amount > 0) {
+    out.sumRub = existingSumRub;
+    out.rate = existingSumRub / amount;
+    out.fillRate = cols.rate != null;
+    return out;
+  }
+
+  if (!sumRubBlank && existingSumRub > 0) {
+    out.sumRub = existingSumRub;
+    if (!rateBlank) out.rate = manualRate;
+    return out;
+  }
+
+  const fxDate = costingTripExpenseFxDateFromRow_(row, cols, fxCache ? fxCache.date : null);
+  if (!fxDate) {
+    if (missingOut) {
+      missingOut.push(Object.assign({
+        reason: 'expense_no_date',
+        currency: currency,
+        amount: amount
+      }, ctx || {}));
+    }
+    return out;
+  }
+
+  const rate = costingResolveFxRateOnDate_(fxCache, currency, fxDate);
+  if (rate == null) {
+    if (missingOut) {
+      missingOut.push(Object.assign({
+        reason: 'cbr',
+        currency: currency,
+        date: fxDate,
+        tranche: 'затраты_рейса'
+      }, ctx || {}));
+    }
+    return out;
+  }
+
+  out.rate = rate;
+  out.sumRub = Math.round(amount * rate * 100) / 100;
+  out.fillRate = rateBlank && cols.rate != null;
+  out.fillSumRub = sumRubBlank && cols.sumRub != null;
+  return out;
+}
+
+/** Записать в «Затраты рейса» рассчитанные Курс_к_RUB и Сумма_RUB (только пустые ячейки). */
+function costingApplyTripExpenseFxFill_(sh, updates) {
+  if (!sh || !updates || !updates.length) return 0;
+  let filled = 0;
+  for (let i = 0; i < updates.length; i++) {
+    const u = updates[i];
+    const sheetRow = u.row + 1;
+    if (u.fillRate && u.rateCol != null && u.rate != null && u.rate > 0) {
+      sh.getRange(sheetRow, u.rateCol + 1).setValue(Math.round(u.rate * 1000000) / 1000000);
+      filled++;
+    }
+    if (u.fillSumRub && u.sumRubCol != null && u.sumRub > 0) {
+      sh.getRange(sheetRow, u.sumRubCol + 1).setValue(Math.round(u.sumRub * 100) / 100);
+    }
+  }
+  return filled;
+}
+
 /**
  * Кэш курсов на одно выполнение пересчёта.
  * Использование:
@@ -1434,28 +2244,40 @@ function costingGetFxRateOnDate_(currencyCode, dateObj) {
 function costingMakeFxCache_(dateObj) {
   return {
     date: dateObj instanceof Date ? dateObj : new Date(),
-    byCurrency: {} // { 'CNY': 10.93, 'USD': null }
+    byCurrency: {},
+    byCurrencyDate: {}
   };
 }
 
-function costingResolveFxRate_(cache, currencyCode) {
+function costingResolveFxRateOnDate_(cache, currencyCode, dateObj) {
   const target = String(currencyCode || '').trim().toUpperCase();
   if (!target) return null;
   if (target === 'RUB') return 1;
-  if (Object.prototype.hasOwnProperty.call(cache.byCurrency, target)) {
-    return cache.byCurrency[target];
+  const key = costingFxDateCacheKey_(target, dateObj);
+  if (Object.prototype.hasOwnProperty.call(cache.byCurrencyDate, key)) {
+    return cache.byCurrencyDate[key];
   }
-  const rate = costingGetFxRateOnDate_(target, cache.date);
-  cache.byCurrency[target] = rate; // null или число — оба кэшируются, чтоб не дёргать ЦБ повторно
+  const rate = costingGetFxRateOnDateWithFallback_(target, dateObj);
+  cache.byCurrencyDate[key] = rate;
   return rate;
 }
 
+function costingResolveFxRate_(cache, currencyCode) {
+  return costingResolveFxRateOnDate_(cache, currencyCode, cache.date);
+}
+
 /**
- * Меню-обёртка: подставить курс ЦБ в пустые «Курс_к_RUB» в «Партии_в_рейсе».
- * Идёт по всем строкам, где «Валюта» ≠ RUB и «Курс_к_RUB» пустой / 0.
- * Один запрос к ЦБ на каждую валюту — кэш разделяется на весь прогон.
- * Если ЦБ недоступен для какой-то валюты — эти строки оставляем без изменений
- * и показываем в финальном отчёте, чтобы пользователь сам разобрался.
+ * Сумма затраты рейса в RUB (см. costingResolveTripExpenseRubDetail_).
+ * @returns {number|null} null — пропустить строку
+ */
+function costingResolveTripExpenseSumRub_(row, cols, fxCache, missingOut, ctx) {
+  const d = costingResolveTripExpenseRubDetail_(row, cols, fxCache, missingOut, ctx);
+  return d.sumRub > 0 ? d.sumRub : null;
+}
+
+/**
+ * Меню-обёртка: подставить курс в пустые «Курс_к_RUB» в «Партии_в_рейсе».
+ * Средневзвешенный ЦБ по траншам из «Сводной» (01); уже заполненный ручной курс не трогаем.
  */
 function costingFillEmptyFxRatesMenu_() {
   try {
@@ -1493,13 +2315,19 @@ function costingFillEmptyFxRatesCore_() {
   }
   const idxShipment = costingFindColOptional_(h, ['SHIPMENT_ID', 'ID_рейса']);
   const idxSku = costingFindColOptional_(h, ['Артикул ВБ', 'Артикул_ВБ', 'WB_ARTICLE']);
+  const idxSpec = costingFindColOptional_(h, [
+    'Номер спецификации', 'Номер_спецификации', 'Спецификация', '№ спецификации', '№спецификации',
+    'Spec', 'Spec number'
+  ]);
 
+  const paymentLoad = costingLoadPaymentTranchesMapSafe_(null);
+  const paymentMap = paymentLoad.map || {};
   const fxCache = costingMakeFxCache_(new Date());
   let filledCount = 0;
-  const ratesUsed = {};          // {CCY: rate}
-  const failedByCurrency = {};   // {CCY: count}
-  const failedSamples = {};      // {CCY: ['shipment/sku', ...]}
-  const updates = [];            // [{rowIdx (1-based), value}]
+  const ratesUsed = {};
+  const failedNoTranches = [];
+  const failedCbr = {};
+  const updates = [];
 
   for (let i = 1; i < data.length; i++) {
     const row = data[i];
@@ -1508,20 +2336,29 @@ function costingFillEmptyFxRatesCore_() {
     const rateCur = costingToNumber_(row[idxRate]);
     if (rateCur > 0) continue;
 
-    const rate = costingResolveFxRate_(fxCache, curRaw);
-    if (rate == null) {
-      failedByCurrency[curRaw] = (failedByCurrency[curRaw] || 0) + 1;
-      if (!failedSamples[curRaw]) failedSamples[curRaw] = [];
-      if (failedSamples[curRaw].length < 5) {
-        const shipmentId = idxShipment != null ? String(row[idxShipment] || '').trim() : '';
-        const sku = idxSku != null ? String(row[idxSku] || '').trim() : '';
-        failedSamples[curRaw].push(shipmentId + ' / ' + (sku || '(пусто)'));
+    const shipmentId = idxShipment != null ? String(row[idxShipment] || '').trim() : '';
+    const sku = idxSku != null ? String(row[idxSku] || '').trim() : '';
+    const spec = idxSpec != null ? String(row[idxSpec] || '').trim() : '';
+    const batchKey = costingPaymentBatchKey_(shipmentId, sku, spec);
+    const fxMissing = [];
+    const resolved = costingResolveFxRateForBatch_(paymentMap, batchKey, '', curRaw, fxCache, fxMissing, {
+      shipmentId: shipmentId,
+      sku: sku,
+      spec: spec
+    });
+    if (!resolved || !(resolved.rate > 0)) {
+      const sample = shipmentId + ' / ' + (sku || '(пусто)');
+      if (fxMissing.length && fxMissing[0].reason === 'cbr') {
+        if (!failedCbr[curRaw]) failedCbr[curRaw] = [];
+        if (failedCbr[curRaw].length < 5) failedCbr[curRaw].push(sample);
+      } else {
+        if (failedNoTranches.length < 8) failedNoTranches.push(sample);
       }
       continue;
     }
-    ratesUsed[curRaw] = rate;
+    ratesUsed[curRaw] = resolved.rate;
     filledCount++;
-    updates.push({ rowIdx: i + 1, value: rate });
+    updates.push({ rowIdx: i + 1, value: resolved.rate });
   }
 
   // Запись: пишем построчно. Для небольшого количества строк это нормально.
@@ -1531,34 +2368,36 @@ function costingFillEmptyFxRatesCore_() {
   }
 
   const lines = [];
-  if (filledCount === 0 && !Object.keys(failedByCurrency).length) {
+  if (filledCount === 0 && !failedNoTranches.length && !Object.keys(failedCbr).length) {
     return {
       title: 'ℹ️ Нечего обновлять',
       message: 'В «Партии_в_рейсе» нет строк с пустым «Курс_к_RUB» (и непустой «Валюта»).'
     };
   }
   if (filledCount) {
-    lines.push('Заполнено строк: ' + filledCount);
+    lines.push('Заполнено строк (средневзв. по оплатам из «Сводной»): ' + filledCount);
     const usedCodes = Object.keys(ratesUsed).sort();
     for (let i = 0; i < usedCodes.length; i++) {
       const code = usedCodes[i];
-      lines.push('  • ' + code + ' = ' + (Math.round(ratesUsed[code] * 10000) / 10000) + ' ₽');
+      lines.push('  • ' + code + ' ≈ ' + (Math.round(ratesUsed[code] * 10000) / 10000) + ' ₽');
     }
   }
-  if (Object.keys(failedByCurrency).length) {
+  if (failedNoTranches.length) {
     if (lines.length) lines.push('');
-    lines.push('Не удалось получить курс ЦБ для:');
-    const codes = Object.keys(failedByCurrency).sort();
+    lines.push('Без траншей в «Сводной» — заполни «Курс_к_RUB» вручную (legacy):');
+    lines.push('  • ' + failedNoTranches.join(', '));
+  }
+  if (Object.keys(failedCbr).length) {
+    if (lines.length) lines.push('');
+    lines.push('ЦБ недоступен на дату платежа:');
+    const codes = Object.keys(failedCbr).sort();
     for (let i = 0; i < codes.length; i++) {
-      const code = codes[i];
-      const sample = failedSamples[code].join(', ');
-      const more = failedByCurrency[code] > failedSamples[code].length
-        ? ' …и ещё ' + (failedByCurrency[code] - failedSamples[code].length)
-        : '';
-      lines.push('  • ' + code + ' — ' + failedByCurrency[code] + ' стр.: ' + sample + more);
+      lines.push('  • ' + codes[i] + ': ' + failedCbr[codes[i]].join(', '));
     }
+  }
+  if (paymentLoad.book01Error) {
     lines.push('');
-    lines.push('Эти строки оставлены как были — заполни «Курс_к_RUB» руками или попробуй позже.');
+    lines.push('ℹ️ Книга 01 недоступна (' + paymentLoad.book01Error + ') — подставлены только строки с траншами, если 01 открылась частично.');
   }
   return {
     title: filledCount ? '✅ Курсы подставлены' : '⚠️ Курсы не получены',
@@ -2284,6 +3123,7 @@ function costingFindSheetByRole_(ss, role) {
     DECL_LINES: ['Декларации_строки', 'Декларации строки'],
     DECL_JOURNAL: ['Декларации_журнал', 'Декларации журнал', 'Загрузки_ДТ', 'Загрузки ДТ'],
     COST_SKU_FACT: ['Факт_себестоимость SKU', 'Факт себестоимость SKU'],
+    PLAN_FACT_COMPARE: ['Сверка план vs факт', 'Сверка план факт', 'План vs факт'],
     TRIPS: ['Рейсы'],
     EVENTS: ['События_рейса', 'События рейса'],
     EVENT_TYPES: ['Типы_событий', 'Типы событий'],
@@ -2305,6 +3145,7 @@ function costingFindSheetByRole_(ss, role) {
     DECL_LINES: ['декларац', 'строк'],
     DECL_JOURNAL: ['декларац', 'журнал', 'загрузк', 'дт'],
     COST_SKU_FACT: ['факт', 'себестоим'],
+    PLAN_FACT_COMPARE: ['сверк', 'план', 'факт'],
     TRIPS: ['рейс'],
     EVENTS: ['событ', 'рейс'],
     EVENT_TYPES: ['типы', 'событ'],
@@ -2729,8 +3570,8 @@ function costingReadSummaryShipmentRows_(summarySh) {
  *   • Валюта по умолчанию — CNY. Перегружается Script Property BATCHES_DEFAULT_CURRENCY
  *     (значения 'CNY' / 'RUB' / 'USD' и т.п.). Если в строке Сводной есть колонка «Валюта»
  *     с непустым значением — она имеет приоритет (per-row override).
- *   • Курс к RUB не заполняется автоматически — пользователь проставляет его руками
- *     для конкретной партии (это конверсионный курс к моменту закупки/оплаты).
+ *   • Курс к RUB при сборке из Сводной не заполняется — пересчёт берёт курс из траншей оплат
+ *     или ручной Курс_к_RUB (legacy).
  */
 function costingBuildBatchRowFromSummary_(sr, batchesHeader) {
   const row = new Array(batchesHeader.length).fill('');

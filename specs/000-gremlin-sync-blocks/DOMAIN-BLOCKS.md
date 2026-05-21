@@ -71,6 +71,7 @@
 | **Партии ← Сводная** | `costing.gs` | safe / refresh / full | Production | safe в цепочке 04; refresh вручную | **OPERATE**; refresh_qty spec при боли «не обновили qty» |
 | **Плановая себестоимость** | `costing.gs` | Пересчёт SKU, FX ЦБ | Production | CBR down → падение | **OPERATE** |
 | **Таможня XML + факт** | `costing_customs_xml.gs` | Декларация → факт vs план | Production | Сложный UX | Spec при новом пресете XML |
+| **Приёмка 3PL (РФ)** | `costing_receipt_3pl.gs` | Импорт акта склада, расхождения vs партии/ДТ | Production | Не в Сводной (01) | **OPERATE**; spec [003](../003-rf-receipt-discrepancies/spec.md) |
 | **Логистика рейсов** | `logistics.gs` | События, ETA, нормативы | Production | Календарные дни | **OPERATE**; sync 05→04 нормативов через хаб |
 | **Оплаты логистики** | `payment_requests_05.gs` | Заявки по «Затраты рейса» | Production | SHIPMENT_ID обязателен | **OPERATE**; daily 05 |
 | **Расписание 05** | `gremlin_scheduled.gs` | Daily payments | Production | — | — |

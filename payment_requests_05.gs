@@ -45,7 +45,7 @@ const PAY_LOG_COL_ALIASES = {
   article: ['Статья_затрат', 'Статья затрат', 'Статья'],
   counterparty: ['Контрагент'],
   currency: ['Валюта'],
-  amount: ['Сумма'],
+  amount: ['Сумма_в_валюте', 'Сумма в валюте', 'Сумма'],
   amountRub: ['Сумма_RUB', 'Сумма RUB'],
   payRequestNo: ['№ заявки', '№ Заявки', 'Номер заявки', 'Номер_заявки'],
   payStatus: ['Статус оплаты', 'Статус_оплаты'],
@@ -155,6 +155,19 @@ function payLogParseAmount_(raw) {
   return isFinite(n) ? n : 0;
 }
 
+/** Сумма к оплате в валюте заявки: «Сумма_в_валюте»/«Сумма»; для RUB — запасной «Сумма_RUB». */
+function payLogAmountFromExpenseRow_(row, cols, currency) {
+  const cur = payLogNorm_(currency).toUpperCase();
+  if (cols.amount >= 0) {
+    const a = payLogParseAmount_(row[cols.amount]);
+    if (a > 0) return a;
+  }
+  if (cols.amountRub >= 0 && cur === 'RUB') return payLogParseAmount_(row[cols.amountRub]);
+  if (cols.amount >= 0) return payLogParseAmount_(row[cols.amount]);
+  if (cols.amountRub >= 0) return payLogParseAmount_(row[cols.amountRub]);
+  return 0;
+}
+
 function payLogQueueId_() {
   const ts = Utilities.formatDate(new Date(), Session.getScriptTimeZone(), 'yyyyMMdd-HHmmss-SSS');
   const rnd = Math.floor(Math.random() * 1000);
@@ -185,7 +198,12 @@ function payLogResolveCols_(map, headers, required) {
   if (required) {
     const missing = [];
     for (let i = 0; i < required.length; i++) {
-      if (out[required[i]] < 0) missing.push(PAY_LOG_COL_ALIASES[required[i]][0]);
+      const key = required[i];
+      if (key === 'amount') {
+        if (out.amount < 0 && out.amountRub < 0) missing.push('Сумма_в_валюте / Сумма / Сумма_RUB');
+        continue;
+      }
+      if (out[key] < 0) missing.push(PAY_LOG_COL_ALIASES[key][0]);
     }
     if (missing.length) {
       const visible = headers
@@ -269,7 +287,7 @@ function payLogReadSelectedRows_(sh, rowIdxs) {
       article: cols.article >= 0 ? payLogNorm_(row[cols.article]) : '',
       counterparty: payLogNorm_(row[cols.counterparty]),
       currency: payLogNorm_(row[cols.currency]).toUpperCase(),
-      amount: payLogParseAmount_(row[cols.amount]),
+      amount: payLogAmountFromExpenseRow_(row, cols, row[cols.currency]),
       payRequestNo: cols.payRequestNo >= 0 ? payLogNorm_(row[cols.payRequestNo]) : '',
       payStatus: cols.payStatus >= 0 ? payLogNorm_(row[cols.payStatus]) : ''
     });
@@ -285,7 +303,7 @@ function payLogValidateSelection_(rows) {
     if (!r.shipmentId) problems.push('строка ' + r.absRow + ': пустой SHIPMENT_ID');
     if (!r.counterparty) problems.push('строка ' + r.absRow + ': пустой Контрагент');
     if (!r.currency || !/^[A-Z]{3}$/.test(r.currency)) problems.push('строка ' + r.absRow + ': пустая или некорректная Валюта (нужен код ISO, напр. CNY)');
-    if (!(r.amount > 0)) problems.push('строка ' + r.absRow + ': Сумма ≤ 0 или не число');
+    if (!(r.amount > 0)) problems.push('строка ' + r.absRow + ': Сумма_в_валюте (или Сумма_RUB для RUB) ≤ 0 или не число');
     const active = r.payStatus && /^(на проверке|на согласовании|оплачено)$/i.test(r.payStatus);
     if (active) problems.push('строка ' + r.absRow + ': уже есть активная заявка (' + r.payRequestNo + ' / ' + r.payStatus + ')');
     if (i === 0) { cp = r.counterparty; cur = r.currency; }

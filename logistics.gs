@@ -258,7 +258,8 @@ function logisticsDefaultEventTypesSeed_() {
     ['RAIL_DEPART', 'Отправление по ЖД', 40, 'ЖД', 'да', 'да'],
     ['SEA_RAIL_TRANSSHIP', 'Перегруз море→ЖД', 48, 'Море + ЖД', 'да', 'да'],
     ['CONSOLIDATION', 'Консолидация (сборный)', 15, 'Сборный груз', 'да', 'да'],
-    ['CONSOL_BATCH', 'Отгрузка партии сборного', 22, 'Сборный груз', 'да', 'да']
+    ['CONSOL_BATCH', 'Отгрузка партии сборного', 22, 'Сборный груз', 'да', 'да'],
+    ['RECEIPT_ACCEPTED', 'Приёмка завершена', 85, '', 'нет', 'нет']
   ];
 }
 
@@ -659,6 +660,14 @@ function logisticsAppendEvent_(ss, shipmentId, eventType, eventDate, comment) {
     events.getRange(1, 1, 1, need.length).setValues([need]);
   }
   events.appendRow(row);
+}
+
+/** Запись события по коду из «Типы_событий» (например RECEIPT_ACCEPTED). */
+function logisticsAppendEventByCode_(ss, shipmentId, eventCode, eventDate, comment) {
+  const catalog = logisticsLoadEventCatalog_(ss);
+  const code = String(eventCode || '').trim();
+  const label = catalog.codeToLabel[code] || code;
+  logisticsAppendEvent_(ss, shipmentId, label, eventDate, comment || '');
 }
 
 function logisticsLoadEventCatalog_(ss) {

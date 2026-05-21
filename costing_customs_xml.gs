@@ -1583,6 +1583,6 @@ function addCostingCustomsMenu_(ui) {
     .addSeparator()
     .addItem('Dry-run факт (по рейсу)', 'costingDryRunFactPrompt_')
     .addItem('Пересчитать фактическую себестоимость', 'rebuildCostingFact_')
-    .addItem('Сверка план vs факт', 'costingComparePlanFactPrompt_')
+    .addItem('📊 Обновить лист «Сверка план vs факт»', 'costingComparePlanFactPrompt_')
     .addToUi();
 }
